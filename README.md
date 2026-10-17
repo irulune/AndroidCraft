@@ -1,224 +1,126 @@
 
-<p align="center">
-  <h1 align="center">AndroidCraft</h1>
-  <p align="center">
-    <b>After Effects-inspired motion graphics, brought to Android.</b>
-  </p>
-  <p align="center">
-    An experimental Android fork of EffectCraft for phones and tablets.
-  </p>
-</p>«[!WARNING]
-AndroidCraft is Extremely Beta (EB).
 
-This project is very early in development. Expect incomplete features, crashes, performance issues, rough touch interactions, and breaking changes. It is currently an experimental project and is not intended for production use.»
+An Android fork of "EffectCraft" (https://github.com/storytold/effectcraft), bringing its After Effects-inspired editor to Android phones and tablets.
 
----
+""Status" (https://img.shields.io/badge/status-Extremely%20Beta-orange?style=flat-square)" (https://github.com/irulune/AndroidCraft)
+""Platform" (https://img.shields.io/badge/platform-Android-3DDC84?style=flat-square&logo=android&logoColor=white)" (https://github.com/irulune/AndroidCraft)
+""Rust" (https://img.shields.io/badge/built%20with-Rust-000000?style=flat-square&logo=rust&logoColor=white)" (https://www.rust-lang.org/)
+""Issues" (https://img.shields.io/github/issues/irulune/AndroidCraft?style=flat-square)" (https://github.com/irulune/AndroidCraft/issues)
+""Stars" (https://img.shields.io/github/stars/irulune/AndroidCraft?style=flat-square)" (https://github.com/irulune/AndroidCraft/stargazers)
 
-What is AndroidCraft?
+«[!WARNING]
+AndroidCraft is extremely beta.
 
-AndroidCraft is an Android-focused fork of "EffectCraft" (https://github.com/storytold/effectcraft), an open-source motion graphics and visual effects editor inspired by Adobe After Effects.
+It's still being worked on, so expect crashes, incomplete features, broken layouts, performance issues, and other problems. It isn't ready for production use yet.»
 
-EffectCraft and Adobe After Effects are primarily designed for desktop environments.
+About
 
-AndroidCraft takes the project in a different direction:
+EffectCraft is an open-source After Effects-inspired editor built around a Rust engine.
 
-«What if an After Effects-style editor could run on a phone or tablet?»
+AndroidCraft is a fork of EffectCraft that focuses on getting that editor running on Android.
 
-The project is an experiment in bringing motion graphics, compositing, animation, and visual-effects workflows to Android devices.
+The main difference is the target platform:
 
-Platforms
+| EffectCraft| AndroidCraft
+Desktop| ✓| —
+Android| —| ✓
+Phones| —| ✓
+Tablets| —| ✓
+ARM64| —| ✓
 
-Platform| Status
-Android phones| 🧪 Extremely Beta
-Android tablets| 🧪 Extremely Beta
-Windows| ❌
-macOS| ❌
-Linux| ❌
+AndroidCraft is currently focused on making the existing editor work well enough on Android. It's not intended to maintain complete feature parity with the desktop version at this point.
 
-AndroidCraft is specifically focused on Android. The desktop versions of EffectCraft are separate from this project.
+Project structure
 
----
+Most of the Android-specific work currently lives in two places:
 
-Relationship to EffectCraft
+crates/
+└── ui-mobile/       # Mobile UI and editor interface
 
-AndroidCraft is a fork of EffectCraft.
+android/
+└── app/             # Android application
 
-EffectCraft is an open-source project that recreates the general workflow and functionality of Adobe After Effects through a clean-room implementation.
+The rest of the editor and engine comes from the EffectCraft source tree.
 
-AndroidCraft uses EffectCraft as its upstream foundation and adds the Android/mobile side of the project.
+Building
 
-In simple terms
-
-Adobe After Effects
-
-↓ inspires
-
-EffectCraft
-
-↓ forked and adapted for Android
-
-AndroidCraft
-
-AndroidCraft is therefore not an official Adobe application and is not affiliated with, sponsored by, or endorsed by Adobe.
-
----
-
-Current Status
-
-AndroidCraft is currently Extremely Beta (EB).
-
-The project is still being actively developed, and the Android experience is far from finished.
-
-Things that may currently be rough include:
-
-- Touch controls
-- Mobile UI layout
-- Performance
-- Device compatibility
-- Rendering
-- Memory usage
-- Missing or incomplete features
-- Android-specific behavior
-- Stability
-
-The fact that an APK successfully builds does not mean that every feature of EffectCraft works correctly on Android.
-
-If something breaks, that's expected at this stage. 🗿
-
----
-
-Building AndroidCraft
-
-AndroidCraft currently uses the EffectCraft source tree as its build foundation.
-
-The Android build can be performed in a Linux-based development environment such as the environment used during development.
+The current build process starts with a specific EffectCraft revision and then adds the AndroidCraft files.
 
 Requirements
 
-You will need:
+You'll need a Linux environment with:
 
 - Git
-- Rust
-- Cargo
-- Java / "keytool"
+- Rust / Cargo
+- Java
 - Android SDK
 - Android NDK
-- Android "aarch64" toolchain
 - "cargo-apk"
 
-The exact environment may vary depending on where you build AndroidCraft.
-
----
-
-1. Set up Rust
-
-Load Cargo's environment:
-
-. ~/.cargo/env
-
-Check that Rust is available:
-
-cargo --version
-
----
-
-2. Clone EffectCraft
-
-Create the working directory:
+1. Clone EffectCraft
 
 mkdir -p ~/workingdir
 cd ~/workingdir
 
-Clone EffectCraft:
-
 git clone https://github.com/storytold/effectcraft.git ec
-
-Enter the repository:
-
 cd ec
 
----
+2. Checkout the compatible revision
 
-3. Checkout the compatible EffectCraft revision
-
-AndroidCraft currently builds against this EffectCraft revision:
+AndroidCraft currently uses this EffectCraft commit:
 
 549e9d825132986d6167c1432cd3328efcbb0278
-
-Fetch it:
 
 git fetch --depth 1 origin \
   549e9d825132986d6167c1432cd3328efcbb0278
 
-Then checkout the revision:
-
 git checkout \
   549e9d825132986d6167c1432cd3328efcbb0278
 
-You can verify it with:
+You can check the current commit with:
 
 git log --oneline -1
 
----
+3. Add AndroidCraft
 
-4. Add AndroidCraft's mobile code
-
-AndroidCraft's development files are placed into the EffectCraft source tree.
-
-From the EffectCraft root:
+Copy the mobile UI:
 
 cp -r ~/workingdir/build/crates/ui-mobile crates/
+
+Then copy the Android project:
+
 cp -r ~/workingdir/build/android .
 
-The resulting project contains:
+The resulting tree should contain:
 
 ec/
 ├── crates/
 │   └── ui-mobile/
-│
 └── android/
     └── app/
 
-The mobile UI is contained in:
-
-crates/ui-mobile
-
-The Android application is contained in:
-
-android/app
-
----
-
-5. Test the mobile UI
+4. Test the mobile UI
 
 From the EffectCraft root:
 
 cargo test -p effectcraft-ui-mobile
 
-This checks the AndroidCraft mobile UI crate before attempting the Android build.
-
----
-
-6. Install "cargo-apk"
-
-Install the Android packaging tool:
+5. Install "cargo-apk"
 
 . ~/.cargo/env
 cargo install cargo-apk --locked
 
-You can verify that it installed correctly with:
+Check that it installed:
 
 cargo apk --version
 
----
+6. Create a debug keystore
 
-7. Create a debug keystore
-
-For local Android development, a debug keystore can be generated inside the Android app directory:
+Move into the Android app directory:
 
 cd ~/workingdir/ec/android/app
 
-Then:
+Generate a debug keystore:
 
 keytool -genkey -v \
   -keystore debug.keystore \
@@ -230,22 +132,15 @@ keytool -genkey -v \
   -validity 10000 \
   -dname "CN=Android Debug,O=Android,C=US"
 
-Verify that it exists:
+Verify it exists:
 
 ls -la debug.keystore
 
-«[!NOTE]
-This is a development/debug keystore. Do not use a debug key as the signing key for a production release.»
+This is only for development. A proper release build should use its own release signing key.
 
----
+7. Build the APK
 
-8. Build the APK
-
-From:
-
-~/workingdir/ec/android/app
-
-run:
+From "android/app":
 
 . ~/.cargo/env
 
@@ -253,116 +148,94 @@ cargo apk build \
   --release \
   --target aarch64-linux-android
 
-The "aarch64-linux-android" target builds for 64-bit ARM Android devices, which covers most modern Android phones and tablets.
+The current build targets "aarch64-linux-android", so the resulting APK is intended for ARM64 Android devices.
 
-The first build can take significantly longer because Rust needs to compile the project and its dependencies.
+8. Find the APK
 
----
-
-9. Find the APK
-
-After the build completes:
+Once the build finishes:
 
 find ~/workingdir/ec \
   -type f \
   -name '*.apk' \
   -print
 
-This will show the generated APK.
+You can transfer the resulting APK to your Android device and install it normally.
 
-You can then transfer the APK to your Android device and install it.
-
-If you have ADB available:
+With ADB:
 
 adb install -r /path/to/androidcraft.apk
 
----
+Building in a sandbox
 
-Development Build Flow
+The project has also been built successfully in a sandboxed Linux environment.
 
-The overall process is:
+The sandbox isn't part of AndroidCraft itself; it is simply one environment that can provide the tools needed to compile the project.
 
-AndroidCraft
-     │
-     ├── crates/ui-mobile
-     │
-     └── android/
-          │
-          ▼
-     EffectCraft source
-          │
-          ▼
-     Rust + cargo-apk
-          │
-          ▼
-     Android AArch64 build
-          │
-          ▼
-     APK
-          │
-          ▼
-   Android phone/tablet
+If you're using another environment, the important parts are still the same:
 
----
+EffectCraft
+    ↓
+checkout compatible commit
+    ↓
+add AndroidCraft
+    ↓
+Rust + Android toolchain
+    ↓
+cargo-apk
+    ↓
+AArch64 APK
 
-Why AndroidCraft?
+Compatibility
 
-Desktop motion-graphics software can be powerful, but it also requires a desktop computer.
+AndroidCraft is currently being developed around ARM64 Android devices.
 
-AndroidCraft explores whether that experience can be brought to hardware that people already carry with them.
+It's primarily intended for:
 
-The long-term idea is simple:
+- Android phones
+- Android tablets
 
-Motion graphics shouldn't necessarily be limited to the desktop.
+Device compatibility hasn't been tested extensively yet, so behavior can vary between devices.
 
----
+If you get it running on a device, feel free to report whether it works and what device you tested it on.
 
-Contributing
+Issues
 
-AndroidCraft is still extremely early, so feedback is especially useful.
+If you run into a problem, open an issue on GitHub.
 
-When reporting a problem, include:
+"Open an issue →" (https://github.com/irulune/AndroidCraft/issues/new)
 
-- Android device model
-- Android version
-- What you were doing
-- Steps to reproduce the issue
-- Expected behavior
-- Actual behavior
-- Screenshots or recordings
-- Relevant logs
+Useful information to include:
 
-Report problems through "GitHub Issues" (https://github.com/irulune/AndroidCraft/issues).
+Device:
+Android version:
+AndroidCraft commit/build:
 
----
+What happened:
 
-Credits
+Steps to reproduce:
+
+Expected behavior:
+
+Actual behavior:
+
+Logs/screenshots:
+
+Upstream
 
 AndroidCraft is based on "EffectCraft" (https://github.com/storytold/effectcraft).
 
-Huge thanks to the EffectCraft contributors for building the upstream project that makes this Android experiment possible.
-
-AndroidCraft is an independent project and does not represent Adobe.
-
-Trademarks
-
-Adobe and After Effects are trademarks or registered trademarks of Adobe Inc. in the United States and/or other countries.
-
-AndroidCraft and EffectCraft are independent open-source projects and are not affiliated with, sponsored by, or endorsed by Adobe Inc.
-
----
+EffectCraft provides the editor and Rust engine that AndroidCraft is currently built around.
 
 License
 
 AndroidCraft is derived from EffectCraft.
 
-Please refer to the upstream EffectCraft repository and the license files included with the source for the applicable licensing terms and attribution requirements.
+See the upstream repository and the license files included with the source for the applicable licensing and attribution requirements.
 
-"EffectCraft on GitHub" (https://github.com/storytold/effectcraft)
+"EffectCraft" (https://github.com/storytold/effectcraft)
+
+Adobe and After Effects are trademarks of Adobe Inc. AndroidCraft is an independent project and is not affiliated with, sponsored by, or endorsed by Adobe.
 
 ---
 
-<p align="center">
-  <b>AndroidCraft</b><br>
-  <sub>Motion graphics beyond the desktop.</sub>
-</p>
+AndroidCraft is still extremely beta. If it works, cool. If it doesn't, that's probably a bug.
