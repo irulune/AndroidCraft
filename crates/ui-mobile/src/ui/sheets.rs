@@ -5,7 +5,18 @@
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::ops::{BLEND_MODES, LABELS, NewLayer, RenderFormat};
+mod ease;
+mod gradient;
+mod link;
+mod picker;
+
+pub(in crate::ui) use ease::EaseState;
+pub(in crate::ui) use gradient::paint_gradient;
+pub(in crate::ui) use link::layer_label;
+pub(in crate::ui) use picker::{MediaThumbs, Picker};
+
+use crate::gallery::{safe_name, unique};
+use crate::ops::{BLEND_MODES, LABELS, MASK_MODES, MaskShape, NewLayer, RenderFormat};
 
 const ROW: f32 = 52.0;
 const HEAD: f32 = 52.0;
@@ -13,27 +24,72 @@ const HEAD: f32 = 52.0;
 pub(super) enum Sheet {
     Add,
     Layer,
+    Track,
     Blend,
     Parent,
     Label,
+    /// One mask of a layer: mode, inversion, removal.
+    Mask {
+        layer: u64,
+        mask: u64,
+    },
+    MaskMode {
+        layer: u64,
+        mask: u64,
+    },
     File,
-    OpenProject,
-    ImportMedia,
+    Project(PathBuf),
+    ConfirmDelete(PathBuf),
+    Media(Box<Picker>),
     Export,
+    /// The curve between a selected keyframe and its neighbour.
+    Ease(EaseState),
+    /// A gradient's colour and opacity stops.
+    Gradient(gradient::GradientState),
+    /// The layer a layer-reference property points at.
+    LayerLink {
+        layer: u64,
+        path: String,
+        name: String,
+    },
+    /// Pick-whip: tie a property to another layer's property.
+    Link(LinkTo),
     Comps,
     NewComp(CompForm),
     CompSettings(CompForm),
-    Effects { query: String },
-    Input { kind: InputKind, value: String, title: String, multiline: bool },
-    Choice { layer: u64, path: String, title: String, options: Vec<(i64, String)>, current: i64 },
-    Prop { layer: u64, path: String, name: String, animated: bool },
+    Effects {
+        query: String,
+    },
+    Input {
+        kind: InputKind,
+        value: String,
+        title: String,
+        multiline: bool,
+    },
+    Choice {
+        layer: u64,
+        path: String,
+        title: String,
+        options: Vec<(i64, String)>,
+        current: i64,
+    },
+    Prop {
+        layer: u64,
+        path: String,
+        name: String,
+        animated: bool,
+        expression: Option<String>,
+    },
 }
 
 pub(super) enum InputKind {
     Rename(u64),
     Text(u64),
     Str(u64, String),
+    /// A property's expression: layer and property path.
+    Expression(u64, String),
     SaveAs,
+    RenameProject(PathBuf),
 }
 
 pub(super) struct CompForm {
@@ -115,6 +171,23 @@ enum Next {
 }
 
 /// Draws the scrim and card; returns the body rectangle and whether the sheet was dismissed.
+/// A pick-whip in progress: the property being linked and, once chosen, the layer it follows.
+#[derive(Clone)]
+pub(super) struct LinkTo {
+    layer: u64,
+    path: String,
+    name: String,
+    target: Option<u64>,
+}
+
+/// The group or property with this id, anywhere below `n`.
+fn find_item(n: &PropNode, uid: u64) -> Option<&PropNode> {
+    if n.uid == uid {
+        return Some(n);
+    }
+    n.children.iter().find_map(|c| find_item(c, uid))
+}
+
 fn frame(ui: &mut Ui, full: ERect, title: &str, body_h: f32, phone: bool, top: bool) -> (ERect, bool) {
     ui.painter().rect_filled(full, 0.0, Color32::from_black_alpha(150));
     let scrim = ui.interact(full, Id::new("sheet-scrim"), Sense::click());
@@ -152,6 +225,14 @@ fn frame(ui: &mut Ui, full: ERect, title: &str, body_h: f32, phone: bool, top: b
     let closed = icon_button(ui, Id::new("sheet-close"), close, Icon::Close, col(DARK.icon), "Close", true).clicked() || scrim.clicked();
     ui.painter().line_segment([pos2(card.left(), card.top() + HEAD), pos2(card.right(), card.top() + HEAD)], Stroke::new(1.0, col(DARK.border)));
     (ERect::from_min_max(pos2(card.left(), card.top() + HEAD + 1.0), card.max), closed)
+}
+
+/// Expressions worth one tap: motion, looping and a time-driven value.
+const EXPRESSION_SNIPPETS: &[&str] = &["wiggle(2, 30)", "loopOut(\"cycle\")", "time * 90", "Math.sin(time * 4) * 50"];
+
+/// The first line of a (possibly long) text, for a one-line subtitle.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
 }
 
 fn item_row(ui: &mut Ui, rect: ERect, id: Id, it: &Item) -> Response {
@@ -203,57 +284,30 @@ fn item_row(ui: &mut Ui, rect: ERect, id: Id, it: &Item) -> Response {
     r
 }
 
-fn safe_name(s: &str) -> String {
-    let cleaned: String = s.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' }).collect();
-    let t = cleaned.trim().trim_matches('.').to_string();
-    let t: String = t.chars().take(60).collect();
-    if t.is_empty() { "Untitled".into() } else { t }
-}
-
-fn unique(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let first = dir.join(format!("{stem}.{ext}"));
-    if !first.exists() {
-        return first;
-    }
-    (2..10_000).map(|n| dir.join(format!("{stem}-{n}.{ext}"))).find(|p| !p.exists()).unwrap_or(first)
-}
-
-const MEDIA_EXT: [&str; 24] = [
-    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "svg", "psd", "mp4", "mov", "m4v", "webm", "mkv", "avi", "mp3", "wav", "ogg", "flac", "aac",
-    "m4a", "exr", "hdr",
-];
-
-fn list_files(dir: &Path, exts: &[&str]) -> Vec<(String, PathBuf)> {
-    let mut out: Vec<(std::time::SystemTime, String, PathBuf)> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|e| {
-            let p = e.path();
-            let ext = p.extension()?.to_str()?.to_ascii_lowercase();
-            if !p.is_file() || !exts.contains(&ext.as_str()) {
-                return None;
-            }
-            let t = e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-            Some((t, p.file_name()?.to_string_lossy().into_owned(), p))
-        })
-        .collect();
-    out.sort_by_key(|b| std::cmp::Reverse(b.0));
-    out.into_iter().map(|(_, n, p)| (n, p)).collect()
-}
-
 impl MobileApp {
-    fn dir(&self, sub: &str) -> PathBuf {
+    /// Opens the expression editor on a property (the layer's property path, e.g. `transform/rotation`).
+    pub fn open_expression_editor(&mut self, layer: u64, path: &str) {
+        let current = self.editor.layer_tree(layer, 8).ok().and_then(|t| t.find(path).and_then(|n| n.expression.clone()));
+        self.sheet = Some(Sheet::Input {
+            kind: InputKind::Expression(layer, path.to_string()),
+            value: current.unwrap_or_else(|| "value".into()),
+            title: "Expression: Rotation".into(),
+            multiline: true,
+        });
+    }
+
+    pub(super) fn dir(&self, sub: &str) -> PathBuf {
         let d = self.storage.join(sub);
         let _ = std::fs::create_dir_all(&d);
         d
     }
 
-    fn forget_selection_caches(&mut self) {
+    pub(super) fn forget_selection_caches(&mut self) {
         self.tree = None;
         self.keys = (u64::MAX, HashMap::new());
         self.sel_key = None;
         self.shown = None;
+        self.asked = None;
         self.view = timeline::View::default();
     }
 
@@ -289,12 +343,20 @@ impl MobileApp {
         let next = match &mut sheet {
             Sheet::Add => self.sheet_add(ui, full, phone, &ctx),
             Sheet::Layer => self.sheet_layer(ui, full, phone, comp, &ctx),
+            Sheet::Track => self.sheet_track(ui, full, phone, comp, &ctx),
             Sheet::Blend => self.sheet_blend(ui, full, phone, comp),
             Sheet::Parent => self.sheet_parent(ui, full, phone, comp),
             Sheet::Label => self.sheet_label(ui, full, phone, comp),
+            Sheet::Mask { layer, mask } => self.sheet_mask(ui, full, phone, *layer, *mask, &ctx),
+            Sheet::MaskMode { layer, mask } => self.sheet_mask_mode(ui, full, phone, *layer, *mask),
             Sheet::File => self.sheet_file(ui, full, phone, comp, &ctx),
-            Sheet::OpenProject => self.sheet_open_project(ui, full, phone, &ctx),
-            Sheet::ImportMedia => self.sheet_import(ui, full, phone, &ctx),
+            Sheet::Project(p) => self.sheet_project(ui, full, phone, p, &ctx),
+            Sheet::ConfirmDelete(p) => self.sheet_confirm_delete(ui, full, phone, p, &ctx),
+            Sheet::Media(p) => self.sheet_media(ui, full, phone, p, &ctx),
+            Sheet::Ease(st) => self.sheet_ease(ui, full, phone, st),
+            Sheet::Gradient(st) => self.sheet_gradient(ui, full, phone, st),
+            Sheet::LayerLink { layer, path, name } => self.sheet_layer_link(ui, full, phone, *layer, path, name, comp),
+            Sheet::Link(link) => self.sheet_link(ui, full, phone, &link.clone(), comp, &ctx),
             Sheet::Export => self.sheet_export(ui, full, phone, comp, &ctx),
             Sheet::Comps => self.sheet_comps(ui, full, phone, comp, &ctx),
             Sheet::NewComp(form) => self.sheet_comp_form(ui, full, phone, form, true, &ctx),
@@ -302,7 +364,9 @@ impl MobileApp {
             Sheet::Effects { query } => self.sheet_effects(ui, full, phone, query, comp, &ctx),
             Sheet::Input { kind, value, title, multiline } => self.sheet_input(ui, full, phone, kind, value, title, *multiline, comp, &ctx),
             Sheet::Choice { layer, path, title, options, current } => self.sheet_choice(ui, full, phone, *layer, path, title, options, *current),
-            Sheet::Prop { layer, path, name, animated } => self.sheet_prop(ui, full, phone, *layer, path, name, *animated, &ctx),
+            Sheet::Prop { layer, path, name, animated, expression } => {
+                self.sheet_prop(ui, full, phone, *layer, path, name, *animated, expression.as_deref(), &ctx)
+            }
         };
         match next {
             Next::Stay => {
@@ -334,7 +398,7 @@ impl MobileApp {
                 Item::new(k.label()).sub(k.hint()).icon(icon)
             })
             .collect();
-        items.push(Item::new("Media from the media folder\u{2026}").sub("Images, video and audio").icon(Icon::Folder));
+        items.push(Item::new("Photos, videos and files\u{2026}").sub("Pick from this device").icon(Icon::Folder));
         match self.list_sheet(ui, full, phone, "Add layer", &items, None) {
             Pick::Close => Next::Close,
             Pick::Row(i) if i < NewLayer::ALL.len() => {
@@ -351,7 +415,7 @@ impl MobileApp {
                     None => Next::Close,
                 }
             }
-            Pick::Row(_) => Next::Open(Sheet::ImportMedia),
+            Pick::Row(_) => Next::Open(Sheet::Media(Box::new(Picker::new()))),
             Pick::Nothing => Next::Stay,
         }
     }
@@ -360,6 +424,7 @@ impl MobileApp {
         let Some(l) = comp.and_then(|c| self.selected(c)).cloned() else { return Next::Close };
         let parent = l.parent.and_then(|p| comp.and_then(|c| c.layers.iter().find(|x| x.id == p)).map(|x| x.name.clone())).unwrap_or_else(|| "None".into());
         let is_text = l.kind == "Text";
+        let is_shape = l.kind == "Shape";
         let items = vec![
             Item::new("Rename\u{2026}").sub(l.name.clone()),
             Item::new("Edit text\u{2026}").enabled(is_text),
@@ -369,6 +434,10 @@ impl MobileApp {
             Item::new(if l.locked { "Unlock layer" } else { "Lock layer" }).icon(Icon::Lock).selected(l.locked),
             Item::new("Solo").selected(l.solo),
             Item::new("3D layer").selected(l.three_d),
+            Item::new("Add rectangle mask").sub("Cut the layer to a shape").icon(Icon::RectOutline),
+            Item::new("Add ellipse mask").icon(Icon::Ellipse),
+            Item::new("Add gradient fill").sub("Shape layers: a colour ramp inside the shape").icon(Icon::StarShape).enabled(is_shape),
+            Item::new("Add gradient stroke").icon(Icon::StarShape).enabled(is_shape),
             Item::new("Bring to front").icon(Icon::ChevronUp),
             Item::new("Bring forward").icon(Icon::ChevronUp),
             Item::new("Send backward").icon(Icon::ChevronDown),
@@ -401,11 +470,37 @@ impl MobileApp {
                     5 => self.editor.toggle_switch(id, "lock", !l.locked),
                     6 => self.editor.toggle_switch(id, "solo", !l.solo),
                     7 => self.editor.toggle_switch(id, "threeD", !l.three_d),
-                    8 => self.editor.arrange(id, "front"),
-                    9 => self.editor.arrange(id, "forward"),
-                    10 => self.editor.arrange(id, "backward"),
-                    11 => self.editor.arrange(id, "back"),
-                    12 => self.editor.duplicate_selected().map(drop),
+                    8 | 9 => {
+                        let shape = if i == 8 { MaskShape::Rectangle } else { MaskShape::Ellipse };
+                        let r = self.editor.add_mask(id, shape);
+                        if let Some(mask) = self.report(r) {
+                            self.show_new_mask(id, mask);
+                            self.notify(ctx, "Mask added");
+                            self.show_panel(false);
+                        }
+                        Ok(())
+                    }
+                    10 | 11 => {
+                        let r = self.editor.add_gradient(id, i == 11);
+                        if let Some(item) = self.report(r) {
+                            // Scroll to the new item's Colors so the gradient can be tapped straight away.
+                            let colors =
+                                self.editor.layer_tree(id, 8).ok().and_then(|t| {
+                                    t.children.iter().find_map(|c| find_item(c, item)).and_then(|g| g.find_kind("gradient").map(|n| n.path.clone()))
+                                });
+                            if let Some(path) = colors {
+                                self.reveal(&path);
+                            }
+                            self.notify(ctx, "Gradient added. Tap its Colors to edit");
+                            self.show_panel(false);
+                        }
+                        Ok(())
+                    }
+                    12 => self.editor.arrange(id, "front"),
+                    13 => self.editor.arrange(id, "forward"),
+                    14 => self.editor.arrange(id, "backward"),
+                    15 => self.editor.arrange(id, "back"),
+                    16 => self.editor.duplicate_selected().map(drop),
                     _ => {
                         let r = self.editor.delete_selected();
                         if r.is_ok() {
@@ -416,6 +511,111 @@ impl MobileApp {
                     }
                 };
                 self.report(r);
+                Next::Close
+            }
+        }
+    }
+
+    /// Opens the mask's group in the property list so the new mask can be edited straight away.
+    pub fn show_new_mask(&mut self, layer: u64, mask: u64) {
+        self.expanded.insert("masks".into());
+        if let Ok(tree) = self.editor.layer_tree(layer, 4)
+            && let Some(m) = tree.masks().into_iter().find(|m| m.uid == mask)
+        {
+            let path = m.path.clone();
+            self.reveal(&path);
+        }
+    }
+
+    fn sheet_mask(&mut self, ui: &mut Ui, full: ERect, phone: bool, layer: u64, mask: u64, ctx: &egui::Context) -> Next {
+        let Some((name, state)) =
+            self.editor.layer_tree(layer, 4).ok().and_then(|t| t.masks().into_iter().find(|m| m.uid == mask).map(|m| (m.name.clone(), m.mask.clone())))
+        else {
+            return Next::Close;
+        };
+        let Some(state) = state else { return Next::Close };
+        let path_prop =
+            self.editor.layer_tree(layer, 4).ok().and_then(|t| t.masks().into_iter().find(|m| m.uid == mask).and_then(|m| m.path_prop().map(|p| p.uid)));
+        let items = vec![
+            Item::new("Edit points").sub("Drag points on the picture, tap an edge to add one").icon(Icon::Fit).enabled(path_prop.is_some()),
+            Item::new("Mode").sub(state.mode.clone()),
+            Item::new("Inverted").sub("Keep what is outside the shape").selected(state.inverted),
+            Item::new("Remove mask").icon(Icon::Trash).danger(),
+        ];
+        match self.list_sheet(ui, full, phone, &name, &items, Some("Feather, opacity and expansion are in the property list")) {
+            Pick::Close => Next::Close,
+            Pick::Nothing => Next::Stay,
+            Pick::Row(0) => {
+                if let Some(prop) = path_prop {
+                    self.edit_points(layer, mask, prop);
+                }
+                Next::Close
+            }
+            Pick::Row(1) => Next::Open(Sheet::MaskMode { layer, mask }),
+            Pick::Row(2) => {
+                let r = self.editor.set_mask_inverted(layer, mask, !state.inverted);
+                self.report(r);
+                Next::Close
+            }
+            Pick::Row(_) => {
+                let r = self.editor.remove_mask(layer, mask);
+                if self.report(r).is_some() {
+                    self.notify(ctx, format!("{name} removed"));
+                }
+                Next::Close
+            }
+        }
+    }
+
+    fn sheet_mask_mode(&mut self, ui: &mut Ui, full: ERect, phone: bool, layer: u64, mask: u64) -> Next {
+        let current = self
+            .editor
+            .layer_tree(layer, 4)
+            .ok()
+            .and_then(|t| t.masks().into_iter().find(|m| m.uid == mask).and_then(|m| m.mask.as_ref().map(|s| s.mode.clone())))
+            .unwrap_or_default();
+        let items: Vec<Item> = MASK_MODES.iter().map(|m| Item::new(*m).selected(*m == current)).collect();
+        match self.list_sheet(ui, full, phone, "Mask mode", &items, None) {
+            Pick::Close => Next::Close,
+            Pick::Nothing => Next::Stay,
+            Pick::Row(i) => {
+                if let Some(mode) = MASK_MODES.get(i) {
+                    let r = self.editor.set_mask_mode(layer, mask, mode);
+                    self.report(r);
+                }
+                Next::Close
+            }
+        }
+    }
+
+    fn sheet_track(&mut self, ui: &mut Ui, full: ERect, phone: bool, comp: Option<&CompView>, ctx: &egui::Context) -> Next {
+        let Some(l) = comp.and_then(|c| self.selected(c)).cloned() else { return Next::Close };
+        let footage = l.kind == "Footage";
+        let busy = self.tracking();
+        let mut items = Vec::new();
+        match busy {
+            Some((kind, fraction)) => {
+                let what = if kind == super::TrackKind::Camera { "Tracking the camera" } else { "Isolating the subject" };
+                items.push(Item::new("Stop").sub(format!("{what}, {}% done", (fraction * 100.0).round() as i32)).icon(Icon::Close).danger());
+            }
+            None => {
+                let hint = if footage { "Adds a 3D camera that follows the clip" } else { "Select a video or image layer first" };
+                items.push(Item::new("Track camera (3D)").sub(hint).icon(Icon::Track).enabled(footage));
+                let hint = if footage { "Tap it in the picture to isolate it" } else { "Select a video or image layer first" };
+                items.push(Item::new("Select subject").sub(hint).icon(Icon::Ellipse).enabled(footage));
+            }
+        }
+        match self.list_sheet(ui, full, phone, &format!("Track: {}", l.name), &items, None) {
+            Pick::Close => Next::Close,
+            Pick::Nothing => Next::Stay,
+            Pick::Row(i) => {
+                if busy.is_some() {
+                    self.stop_track(ctx);
+                } else if i == 0 {
+                    self.begin_camera_track(ctx, l.id);
+                } else {
+                    self.begin_subject_pick(l.id);
+                }
                 Next::Close
             }
         }
@@ -472,8 +672,8 @@ impl MobileApp {
         let dirty = self.editor.is_dirty().unwrap_or(false);
         let items = vec![
             Item::new("New project").icon(Icon::Plus),
-            Item::new("Open demo project").sub("The EffectCraft intro, with 3D and effects").icon(Icon::Film),
-            Item::new("Open project\u{2026}").sub("Saved in the projects folder").icon(Icon::Folder),
+            Item::new("Open demo project").sub("The Effectia intro, with 3D and effects").icon(Icon::Film),
+            Item::new("Projects").sub("Your saved projects, with previews").icon(Icon::Folder),
             Item::new("Save").icon(Icon::Floppy).sub(match (&path, dirty) {
                 (Some(p), true) => {
                     format!("Unsaved changes \u{00b7} {}", Path::new(p).file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))
@@ -507,7 +707,10 @@ impl MobileApp {
                     }
                     Next::Close
                 }
-                2 => Next::Open(Sheet::OpenProject),
+                2 => {
+                    self.show_gallery();
+                    Next::Close
+                }
                 3 => {
                     let target = match path {
                         Some(p) => p,
@@ -537,55 +740,68 @@ impl MobileApp {
         }
     }
 
-    fn sheet_open_project(&mut self, ui: &mut Ui, full: ERect, phone: bool, ctx: &egui::Context) -> Next {
-        let files = list_files(&self.dir("projects"), &["ecproj"]);
-        let mut items: Vec<Item> = files.iter().map(|(n, _)| Item::new(n.clone()).icon(Icon::Film)).collect();
-        if items.is_empty() {
-            items.push(Item::new("No saved projects yet").sub("Use File \u{25b8} Save, then it appears here").enabled(false));
-        }
-        let footer = format!("Folder: {}", self.dir("projects").display());
-        match self.list_sheet(ui, full, phone, "Open project", &items, Some(&footer)) {
+    /// The menu behind a gallery card's three dots.
+    fn sheet_project(&mut self, ui: &mut Ui, full: ERect, phone: bool, path: &Path, ctx: &egui::Context) -> Next {
+        let name = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let items = vec![
+            Item::new("Open").icon(Icon::Folder),
+            Item::new("Rename\u{2026}").icon(Icon::TextT),
+            Item::new("Duplicate").icon(Icon::Copy),
+            Item::new("Delete\u{2026}").icon(Icon::Trash).danger(),
+        ];
+        match self.list_sheet(ui, full, phone, &name, &items, None) {
             Pick::Close => Next::Close,
             Pick::Nothing => Next::Stay,
-            Pick::Row(i) => {
-                if let Some((name, path)) = files.get(i) {
-                    let r = self.editor.open(&path.to_string_lossy());
-                    if self.report(r).is_some() {
-                        self.forget_selection_caches();
-                        self.notify(ctx, format!("Opened {name}"));
-                    }
+            Pick::Row(0) => {
+                self.open_project_file(path, ctx);
+                Next::Close
+            }
+            Pick::Row(1) => {
+                Next::Open(Sheet::Input { kind: InputKind::RenameProject(path.to_path_buf()), value: name, title: "Rename project".into(), multiline: false })
+            }
+            Pick::Row(2) => {
+                let r = self.duplicate_project(path, ctx);
+                if let Err(e) = r {
+                    self.notify(ctx, e.to_string());
                 }
                 Next::Close
             }
+            Pick::Row(_) => Next::Open(Sheet::ConfirmDelete(path.to_path_buf())),
         }
     }
 
-    fn sheet_import(&mut self, ui: &mut Ui, full: ERect, phone: bool, ctx: &egui::Context) -> Next {
-        let dir = self.dir("media");
-        let files = list_files(&dir, &MEDIA_EXT);
-        let mut items: Vec<Item> = files.iter().map(|(n, _)| Item::new(n.clone()).icon(Icon::Film)).collect();
-        if items.is_empty() {
-            items.push(Item::new("No media files yet").sub("Copy images, video or audio into the folder below, then open this list again").enabled(false));
-        }
-        let footer = format!("Media folder: {}", dir.display());
-        match self.list_sheet(ui, full, phone, "Add media as a layer", &items, Some(&footer)) {
+    fn sheet_confirm_delete(&mut self, ui: &mut Ui, full: ERect, phone: bool, path: &Path, ctx: &egui::Context) -> Next {
+        let name = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let items = vec![Item::new("Delete project").sub("This cannot be undone").icon(Icon::Trash).danger(), Item::new("Keep it").icon(Icon::Close)];
+        match self.list_sheet(ui, full, phone, &format!("Delete \u{201c}{name}\u{201d}?"), &items, None) {
             Pick::Close => Next::Close,
             Pick::Nothing => Next::Stay,
-            Pick::Row(i) => {
-                if let Some((name, path)) = files.get(i) {
-                    let r = self.editor.import_and_add(&path.to_string_lossy());
-                    if self.report(r).is_some() {
-                        self.notify(ctx, format!("{name} added as a layer"));
-                    }
+            Pick::Row(0) => {
+                if let Err(e) = self.delete_project(path, ctx) {
+                    self.notify(ctx, e.to_string());
                 }
                 Next::Close
             }
+            Pick::Row(_) => Next::Close,
         }
     }
 
     fn sheet_export(&mut self, ui: &mut Ui, full: ERect, phone: bool, comp: Option<&CompView>, ctx: &egui::Context) -> Next {
         let Some(c) = comp else { return Next::Close };
-        let busy = self.job.is_some();
+        if let Some((footer, cancel)) = self.job.as_ref().map(|j| (format!("{} {}%", j.label, j.percent()), j.cancel.clone())) {
+            // A render is running: the one useful thing to offer is stopping it.
+            let items = vec![Item::new("Stop rendering").sub("Nothing is saved").icon(Icon::Close).danger()];
+            return match self.list_sheet(ui, full, phone, "Rendering", &items, Some(&footer)) {
+                Pick::Close => Next::Close,
+                Pick::Nothing => Next::Stay,
+                Pick::Row(_) => {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.notify(ctx, "Stopping the render\u{2026}");
+                    Next::Close
+                }
+            };
+        }
+        let busy = false;
         let frames = (c.duration * c.frame_rate).round() as u64;
         let items = vec![
             Item::new("Current frame as PNG").sub(format!("{} \u{00d7} {} at {}", c.width, c.height, timecode(c.time, c.frame_rate))).icon(Icon::Export),
@@ -622,6 +838,7 @@ impl MobileApp {
 
     /// Saves a copy of the project and renders it on its own session in a background thread.
     fn start_render(&mut self, ctx: &egui::Context, c: &CompView, fmt: RenderFormat, half: bool, label: &str) {
+        use std::sync::atomic::{AtomicBool, Ordering};
         let tmp = self.dir("tmp").join(format!("render-{}.ecproj", c.id));
         let copy = self.editor.command("file.saveCopy", serde_json::json!({ "path": tmp.to_string_lossy() }));
         if let Err(e) = copy {
@@ -631,37 +848,60 @@ impl MobileApp {
         let ext = if fmt == RenderFormat::Mp4 { "mp4" } else { "gif" };
         let out = unique(&self.dir("exports"), &safe_name(&c.name), ext);
         let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
         let (project, out_s, comp_id) = (tmp.to_string_lossy().into_owned(), out.to_string_lossy().into_owned(), c.id);
         let repaint = ctx.clone();
-        let spawned = std::thread::Builder::new().name("effectcraft-render".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("effectia-render".into()).spawn(move || {
             let mut session = effectcraft_host::session();
-            let r = crate::ops::render_saved_project(&mut session, &project, comp_id, &out_s, fmt, half).map_err(|e| e.to_string());
+            let progress_tx = tx.clone();
+            let progress_ctx = repaint.clone();
+            let mut progress = move |f: f32| {
+                let _ = progress_tx.send(RenderMsg::Progress(f));
+                progress_ctx.request_repaint();
+                !stop.load(Ordering::Relaxed)
+            };
+            let r = crate::ops::render_saved_project(&mut session, &project, comp_id, &out_s, fmt, half, &mut progress).map_err(|e| e.to_string());
             let _ = std::fs::remove_file(&project);
-            let _ = tx.send(r);
+            if r.is_err() {
+                // A stopped or failed render leaves a partial file nobody wants.
+                let _ = std::fs::remove_file(&out_s);
+            }
+            let _ = tx.send(RenderMsg::Done(r));
             repaint.request_repaint();
         });
         match spawned {
-            Ok(_) => self.job = Some(RenderJob { rx, label: label.to_string() }),
+            Ok(_) => self.job = Some(RenderJob { rx, label: label.to_string(), fraction: 0.0, cancel }),
             Err(e) => self.status = Some(format!("could not start the render: {e}")),
         }
     }
 
     pub(super) fn poll_render(&mut self, ctx: &egui::Context) {
         use std::sync::mpsc::TryRecvError;
-        let Some(job) = &self.job else { return };
-        match job.rx.try_recv() {
-            Ok(Ok(path)) => {
-                self.job = None;
-                self.notify(ctx, format!("Saved {path}"));
-            }
-            Ok(Err(e)) => {
-                self.job = None;
-                self.status = Some(format!("Render failed: {e}"));
-            }
-            Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(300)),
-            Err(TryRecvError::Disconnected) => {
-                self.job = None;
-                self.status = Some("The render stopped unexpectedly".into());
+        loop {
+            let Some(job) = self.job.as_mut() else { return };
+            match job.rx.try_recv() {
+                Ok(RenderMsg::Progress(f)) => job.fraction = f,
+                Ok(RenderMsg::Done(Ok(path))) => {
+                    self.job = None;
+                    self.notify(ctx, format!("Saved {path}"));
+                }
+                Ok(RenderMsg::Done(Err(e))) if e == crate::ops::RENDER_CANCELLED => {
+                    self.job = None;
+                    self.notify(ctx, "Render cancelled");
+                }
+                Ok(RenderMsg::Done(Err(e))) => {
+                    self.job = None;
+                    self.status = Some(format!("Render failed: {e}"));
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.status = Some("The render stopped unexpectedly".into());
+                }
             }
         }
     }
@@ -889,7 +1129,9 @@ impl MobileApp {
         ctx: &egui::Context,
     ) -> Next {
         let _ = comp;
-        let (body, closed) = frame(ui, full, title, if multiline { 220.0 } else { 150.0 }, phone, true);
+        let snippets: &[&str] = if matches!(kind, InputKind::Expression(..)) { EXPRESSION_SNIPPETS } else { &[] };
+        let extra = if snippets.is_empty() { 0.0 } else { 96.0 };
+        let (body, closed) = frame(ui, full, title, extra + if multiline { 220.0 } else { 150.0 }, phone, true);
         let mut ok = false;
         let mut cancel = false;
         self.scoped(ui, body.shrink2(vec2(tokens::SPACE_4, tokens::SPACE_2)), |_, ui| {
@@ -903,6 +1145,26 @@ impl MobileApp {
             r.widget_info(|| WidgetInfo::labeled(WidgetType::TextEdit, true, "Value"));
             if !r.has_focus() && ui.ctx().memory(|m| m.focused().is_none()) {
                 r.request_focus();
+            }
+            if !snippets.is_empty() {
+                // Typing code on a phone is slow: common starting points insert with one tap.
+                let half = (ui.available_width() - 8.0) / 2.0;
+                for pair in snippets.chunks(2) {
+                    ui.horizontal(|ui| {
+                        for snippet in pair {
+                            let b = ui.add_sized(vec2(half, 40.0), egui::Button::new(egui::RichText::new(*snippet).size(13.0)));
+                            b.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Insert {snippet}")));
+                            if b.clicked() {
+                                if value.trim().is_empty() || value.trim() == "value" {
+                                    *value = (*snippet).to_string();
+                                } else {
+                                    value.push('\n');
+                                    value.push_str(snippet);
+                                }
+                            }
+                        }
+                    });
+                }
             }
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 8.0) / 2.0;
@@ -926,6 +1188,14 @@ impl MobileApp {
             InputKind::Rename(l) => self.editor.rename_layer(*l, value),
             InputKind::Text(l) => self.editor.set_text(*l, value),
             InputKind::Str(l, path) => self.editor.set_str(*l, path, value),
+            InputKind::Expression(l, path) => {
+                let r = self.editor.set_expression(*l, path, value);
+                if r.is_ok() {
+                    self.notify(ctx, if value.trim().is_empty() { "Expression removed" } else { "Expression set" });
+                }
+                r
+            }
+            InputKind::RenameProject(p) => self.rename_project(p, value, ctx),
             InputKind::SaveAs => {
                 let out = self.dir("projects").join(format!("{}.ecproj", safe_name(value)));
                 match self.editor.save(Some(&out.to_string_lossy())) {
@@ -957,25 +1227,53 @@ impl MobileApp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn sheet_prop(&mut self, ui: &mut Ui, full: ERect, phone: bool, layer: u64, path: &str, name: &str, animated: bool, ctx: &egui::Context) -> Next {
+    fn sheet_prop(
+        &mut self,
+        ui: &mut Ui,
+        full: ERect,
+        phone: bool,
+        layer: u64,
+        path: &str,
+        name: &str,
+        animated: bool,
+        expression: Option<&str>,
+        ctx: &egui::Context,
+    ) -> Next {
         let items = vec![
             Item::new("Reset to default").sub("Removes keyframes and expressions on this property"),
             Item::new(if animated { "Add or remove keyframe at playhead" } else { "Add keyframe at playhead" }).icon(Icon::Diamond),
             Item::new("Previous keyframe").icon(Icon::KeyPrev).enabled(animated),
             Item::new("Next keyframe").icon(Icon::KeyNext).enabled(animated),
+            Item::new(if expression.is_some() { "Edit expression\u{2026}" } else { "Add expression\u{2026}" })
+                .sub(expression.map(first_line).unwrap_or_default())
+                .icon(Icon::Fx),
+            Item::new("Remove expression").icon(Icon::Trash).enabled(expression.is_some()),
+            Item::new("Link to another property\u{2026}").sub("Follow a property of any layer").icon(Icon::Fx),
         ];
         match self.list_sheet(ui, full, phone, name, &items, None) {
             Pick::Close => Next::Close,
             Pick::Nothing => Next::Stay,
+            Pick::Row(4) => Next::Open(Sheet::Input {
+                kind: InputKind::Expression(layer, path.to_string()),
+                value: expression.unwrap_or("value").to_string(),
+                title: format!("Expression: {name}"),
+                multiline: true,
+            }),
+            Pick::Row(6) => Next::Open(Sheet::Link(LinkTo { layer, path: path.to_string(), name: name.to_string(), target: None })),
             Pick::Row(i) => {
                 let r = match i {
                     0 => self.editor.reset_prop(layer, path),
                     1 => self.editor.toggle_key(layer, path),
                     2 => self.editor.go_to_prop_key(layer, path, false),
-                    _ => self.editor.go_to_prop_key(layer, path, true),
+                    3 => self.editor.go_to_prop_key(layer, path, true),
+                    _ => self.editor.set_expression(layer, path, ""),
                 };
-                if self.report(r).is_some() && i == 0 {
-                    self.notify(ctx, format!("{name} reset"));
+                if self.report(r).is_some() {
+                    match i {
+                        0 => self.notify(ctx, format!("{name} reset")),
+                        5 => self.notify(ctx, "Expression removed"),
+                        _ => {}
+                    }
                 }
                 Next::Close
             }

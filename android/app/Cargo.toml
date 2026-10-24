@@ -1,11 +1,11 @@
 [package]
-name = "androidcraft"
+name = "effectia"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [lib]
-name = "androidcraft"
+name = "effectia"
 crate-type = ["cdylib"]
 
 # Standalone workspace: the Android entry point needs `#[no_mangle]`, which the main workspace
@@ -14,10 +14,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 effectcraft-host = { path = "../../crates/host" }
-effectcraft-ui-mobile = { path = "../../crates/ui-mobile" }
+effectia-ui-mobile = { path = "../../crates/ui-mobile" }
 eframe = { version = "0.36", default-features = false, features = ["android-native-activity", "glow", "default_fonts"] }
 egui = "0.36"
 log = "0.4"
+jni = "0.21"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
@@ -30,8 +31,8 @@ lto = false
 debug = false
 
 [package.metadata.android]
-package = "app.androidcraft"
-apk_name = "AndroidCraft"
+package = "app.effectia"
+apk_name = "Effectia"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
@@ -39,8 +40,35 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [package.metadata.android.application]
-label = "AndroidCraft"
+label = "Effectia"
+# Not fullscreen: the status bar stays visible and the app sits below it.
+theme = "@android:style/Theme.DeviceDefault.NoActionBar"
+
+# Split-screen, freeform windows and foldables: the window may be resized at any time, and the
+# activity must be told about it rather than restarted (a restart would close the project). The
+# list names every configuration change a resize can bring.
+[package.metadata.android.application.activity]
+resizeable_activity = true
+config_changes = "orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation|uiMode|layoutDirection|fontScale"
 
 [package.metadata.android.signing.release]
 path = "debug.keystore"
 keystore_password = "android"
+
+# Reading photos, videos and files. The picker asks at run time; these declare what it may ask for.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_VIDEO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+
+# "All files access" (Android 11+): optional, granted by the user from a system settings page.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"

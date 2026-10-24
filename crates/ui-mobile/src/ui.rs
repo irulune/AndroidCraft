@@ -11,9 +11,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
+mod gallery;
+mod pathedit;
 mod props;
 mod sheets;
+mod splitters;
 mod timeline;
 
 use egui::{
@@ -22,10 +26,15 @@ use egui::{
 };
 
 use crate::editor::{CompView, Editor, Frame, LayerRow};
+use crate::gallery::{safe_name, unique};
 use crate::keys::{self, Modifiers};
 use crate::layout::{self, LayoutState, Rect, Viewport, WorkspaceKind};
 use crate::ops::{EffectInfo, PropNode};
+use crate::platform::{Desktop, Platform};
+use crate::renderer::{FrameRenderer, RenderWorker, Stamp};
 use crate::tokens::{self, DARK, Rgba, label_color};
+
+pub use gallery::Screen;
 
 static INTER_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 static INTER_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/Inter-Medium.ttf");
@@ -33,6 +42,8 @@ static INTER_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiB
 static JETBRAINS_MONO: &[u8] = include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf");
 
 pub(crate) const TAB_H: f32 = 32.0;
+/// How long after the time last moved the viewer still counts as scrubbing (draft frames).
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(180);
 const ROW_H: f32 = tokens::MIN_TOUCH_TARGET;
 const RULER_H: f32 = 32.0;
 
@@ -42,6 +53,17 @@ fn col(c: Rgba) -> Color32 {
 
 fn erect(r: Rect, origin: Pos2) -> ERect {
     ERect::from_min_size(pos2(origin.x + r.x, origin.y + r.y), vec2(r.w, r.h))
+}
+
+/// How big to draw a frame while things move: as large as keeps about 25 frames a second at the
+/// speed the engine has been drawing at (`cost` is nanoseconds per pixel), between a quarter of the
+/// full size and the full size. Before anything is known, half size.
+pub fn draft_side(cost: Option<f64>, full_side: u32, comp_w: u32, comp_h: u32) -> u32 {
+    const TARGET_NS: f64 = 40e6;
+    let Some(per_px) = cost.filter(|c| c.is_finite() && *c > 0.0) else { return (full_side / 2).max(64) };
+    let aspect = (f64::from(comp_h.max(1)) / f64::from(comp_w.max(1))).clamp(0.1, 1.0);
+    let long = (TARGET_NS / per_px / aspect).sqrt();
+    (long as u32).clamp((full_side / 4).max(64), full_side.max(64))
 }
 
 /// `h:mm:ss:ff` timecode, the same format as the desktop app. Total: bad input reads as zero.
@@ -147,6 +169,7 @@ enum Icon {
     Export,
     Lock,
     Fit,
+    Track,
     TextT,
     SolidSq,
     RectOutline,
@@ -157,6 +180,7 @@ enum Icon {
     Cube,
     Folder,
     Floppy,
+    Music,
 }
 
 fn tri(p: &Painter, c: Pos2, r: f32, right: bool, color: Color32) {
@@ -435,6 +459,14 @@ fn paint_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
                 st,
             ));
         }
+        Icon::Music => {
+            // Two note heads under a beam.
+            p.circle_filled(pos2(c.x - 4.5 * u, c.y + 5.0 * u), 2.8 * u, color);
+            p.circle_filled(pos2(c.x + 5.5 * u, c.y + 3.0 * u), 2.8 * u, color);
+            p.line_segment([pos2(c.x - 2.0 * u, c.y + 5.0 * u), pos2(c.x - 2.0 * u, c.y - 6.5 * u)], st);
+            p.line_segment([pos2(c.x + 8.0 * u, c.y + 3.0 * u), pos2(c.x + 8.0 * u, c.y - 8.5 * u)], st);
+            p.line_segment([pos2(c.x - 2.0 * u, c.y - 6.5 * u), pos2(c.x + 8.0 * u, c.y - 8.5 * u)], Stroke::new(st.width * 1.5, color));
+        }
         Icon::Floppy => {
             p.rect_stroke(ERect::from_center_size(c, vec2(15.0 * u, 15.0 * u)), 2.0, st, StrokeKind::Middle);
             p.rect_stroke(
@@ -444,6 +476,13 @@ fn paint_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
                 StrokeKind::Middle,
             );
             p.rect_filled(ERect::from_min_max(pos2(c.x - 4.0 * u, c.y + 2.0 * u), pos2(c.x + 4.0 * u, c.y + 7.5 * u)), 1.0, color);
+        }
+        Icon::Track => {
+            p.circle_stroke(c, 7.0 * u, st);
+            p.circle_stroke(c, 2.2 * u, st);
+            for (dx, dy) in [(-1.0_f32, 0.0_f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
+                p.line_segment([pos2(c.x + dx * 7.0 * u, c.y + dy * 7.0 * u), pos2(c.x + dx * 10.0 * u, c.y + dy * 10.0 * u)], st);
+            }
         }
         Icon::Fit => {
             for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
@@ -460,6 +499,15 @@ fn paint_icon(p: &Painter, icon: Icon, c: Pos2, size: f32, color: Color32) {
 pub enum PanelTab {
     Properties,
     Effects,
+}
+
+/// What a touch on the picture does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Tap a layer to select it; drag it to move it.
+    Select,
+    /// Drag anywhere to move the selected layer; taps do nothing.
+    Move,
 }
 
 /// A selected keyframe: the property it is on and its time in layer seconds.
@@ -479,8 +527,46 @@ struct TreeCache {
 
 /// A render running on its own session so the editor stays usable.
 struct RenderJob {
-    rx: Receiver<Result<String, String>>,
+    rx: Receiver<RenderMsg>,
     label: String,
+    fraction: f32,
+    /// Set to ask the worker to stop the render.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum RenderMsg {
+    Progress(f32),
+    Done(Result<String, String>),
+}
+
+impl RenderJob {
+    fn percent(&self) -> i32 {
+        (self.fraction * 100.0).round() as i32
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrackKind {
+    Camera,
+    Subject,
+}
+
+/// A camera solve or subject isolation running inside the engine.
+struct TrackJob {
+    kind: TrackKind,
+    layer: u64,
+    effect: u64,
+    fraction: f32,
+}
+
+impl TrackJob {
+    fn label(&self) -> String {
+        let what = match self.kind {
+            TrackKind::Camera => "Tracking camera",
+            TrackKind::Subject => "Isolating subject",
+        };
+        format!("{what} {}%", (self.fraction * 100.0).round() as i32)
+    }
 }
 
 /// The whole touch workspace.
@@ -489,16 +575,39 @@ pub struct MobileApp {
     pub layout: LayoutState,
     pub playing: bool,
     texture: Option<TextureHandle>,
-    shown: Option<(u64, i64, u32)>,
+    /// What the viewer texture currently shows.
+    shown: Option<Stamp>,
+    /// The newest frame asked of the worker (so the same one is not asked for twice).
+    asked: Option<Stamp>,
+    worker: Option<RenderWorker>,
+    worker_tried: bool,
+    /// How long after the time last moved the viewer still counts as scrubbing.
+    pub settle: std::time::Duration,
+    /// Whether the properties panel could be docked the last time the window was laid out, and
+    /// whether it was open then (to bring it back when the window grows again).
+    can_dock: Option<bool>,
+    dock_memory: bool,
+    /// Nanoseconds the engine spent per pixel on recent draft frames.
+    draft_cost: Option<f64>,
+    /// A panel edge is being dragged.
+    splitting: bool,
+    /// The project copy the worker draws from, with the revision it was taken at.
+    source: Option<(u64, Arc<FrameRenderer>)>,
+    /// What the viewer last showed, and when it last moved in time (to tell scrubbing from rest).
+    scrub: Option<((u64, i64), Instant, bool)>,
     pub status: Option<String>,
     themed: bool,
     /// A short confirmation shown at the bottom, with the time it expires.
     notice: Option<(String, f64)>,
     /// Where projects, exports and media live (`projects/`, `exports/`, `media/`).
     pub storage: PathBuf,
+    /// Space the system covers (status bar, cutout, gesture bar), in points. The host sets it each frame.
+    pub safe: layout::Insets,
     sheet: Option<sheets::Sheet>,
     panel_tab: PanelTab,
     expanded: HashSet<String>,
+    /// A property group to scroll into view the next time the list is drawn.
+    reveal: Option<String>,
     catalog: Option<Rc<Vec<EffectInfo>>>,
     tree: Option<TreeCache>,
     keys: (u64, HashMap<u64, Rc<PropNode>>),
@@ -506,7 +615,19 @@ pub struct MobileApp {
     drag: Option<timeline::Drag>,
     sel_key: Option<SelKey>,
     viewer_drag: bool,
+    /// The layer the current viewer drag moves.
+    viewer_target: Option<u64>,
+    view_mode: ViewMode,
     job: Option<RenderJob>,
+    track: Option<TrackJob>,
+    pick_subject: Option<u64>,
+    /// The path whose points are being edited on the picture.
+    path_edit: Option<pathedit::PathEdit>,
+    screen: Screen,
+    gallery: gallery::GalleryState,
+    /// Device services: file permissions and the folders to browse.
+    platform: Rc<dyn Platform>,
+    media_thumbs: sheets::MediaThumbs,
 }
 
 /// An icon-only button: 44 pt touch target, hover / pressed fill, accessibility label.
@@ -530,13 +651,25 @@ impl MobileApp {
             playing: false,
             texture: None,
             shown: None,
+            asked: None,
+            worker: None,
+            worker_tried: false,
+            settle: SETTLE,
+            can_dock: None,
+            dock_memory: false,
+            draft_cost: None,
+            splitting: false,
+            source: None,
+            scrub: None,
             status: None,
             themed: false,
             notice: None,
-            storage: std::env::temp_dir().join("effectcraft"),
+            storage: std::env::temp_dir().join("effectia"),
+            safe: layout::Insets::default(),
             sheet: None,
             panel_tab: PanelTab::Properties,
             expanded: HashSet::from(["transform".to_string()]),
+            reveal: None,
             catalog: None,
             tree: None,
             keys: (u64::MAX, HashMap::new()),
@@ -544,18 +677,28 @@ impl MobileApp {
             drag: None,
             sel_key: None,
             viewer_drag: false,
+            viewer_target: None,
+            view_mode: ViewMode::Select,
             job: None,
+            track: None,
+            pick_subject: None,
+            path_edit: None,
+            screen: Screen::Editor,
+            gallery: gallery::GalleryState::default(),
+            platform: Rc::new(Desktop::home()),
+            media_thumbs: sheets::MediaThumbs::default(),
         }
     }
 
     /// Opens a sheet by name (`add`, `layer`, `file`, `comps`, `effects`, `blend`, `parent`, `label`,
-    /// `export`, `open`, `media`, `newcomp`, `settings`); false for an unknown name. This is how the
+    /// `export`, `open` (the gallery), `media`, `newcomp`, `settings`); false for an unknown name. This is how the
     /// control channel and the screenshot tool reach the sheets without tapping.
     pub fn open_sheet(&mut self, name: &str) -> bool {
         use sheets::{CompForm, Sheet};
         let sheet = match name {
             "add" => Sheet::Add,
             "layer" => Sheet::Layer,
+            "track" => Sheet::Track,
             "file" => Sheet::File,
             "comps" => Sheet::Comps,
             "effects" => Sheet::Effects { query: String::new() },
@@ -563,13 +706,26 @@ impl MobileApp {
             "parent" => Sheet::Parent,
             "label" => Sheet::Label,
             "export" => Sheet::Export,
-            "open" => Sheet::OpenProject,
-            "media" => Sheet::ImportMedia,
+            "open" | "gallery" => return self.show_gallery(),
+            "media" => Sheet::Media(Box::new(sheets::Picker::new())),
+            "ease" => {
+                self.open_ease_editor();
+                return self.sheet.is_some();
+            }
             "newcomp" => Sheet::NewComp(CompForm::default_new()),
             _ => return false,
         };
         self.sheet = Some(sheet);
         true
+    }
+
+    /// Selects one keyframe, as tapping it in the timeline does (layer seconds).
+    pub fn select_keyframe(&mut self, layer: u64, path: &str, time: f64) -> bool {
+        let ok = self.editor.select_key(layer, path, time).is_ok();
+        if ok {
+            self.sel_key = Some(SelKey { layer, path: path.to_string(), time });
+        }
+        ok
     }
 
     /// Shows the Properties or Effects tab of the properties panel.
@@ -581,6 +737,19 @@ impl MobileApp {
     /// Expands a property group (or an effect) in the properties panel by its path.
     pub fn expand(&mut self, path: &str) {
         self.expanded.insert(path.to_string());
+    }
+
+    /// Opens a property group (and the groups around it) and scrolls the list to it.
+    pub fn reveal(&mut self, path: &str) {
+        let mut at = String::new();
+        for part in path.split('/') {
+            if !at.is_empty() {
+                at.push('/');
+            }
+            at.push_str(part);
+            self.expanded.insert(at.clone());
+        }
+        self.reveal = Some(path.to_string());
     }
 
     /// Closes any open sheet.
@@ -596,6 +765,13 @@ impl MobileApp {
     /// Chooses where projects (`projects/`), exports (`exports/`) and importable media (`media/`) live.
     pub fn with_storage(mut self, dir: impl Into<PathBuf>) -> MobileApp {
         self.storage = dir.into();
+        self.load_panel_sizes();
+        self
+    }
+
+    /// Chooses the device services behind the media picker (permissions and folders).
+    pub fn with_platform(mut self, platform: impl Platform + 'static) -> MobileApp {
+        self.platform = Rc::new(platform);
         self
     }
 
@@ -686,6 +862,13 @@ impl MobileApp {
             self.editor.end_gesture();
         }
         self.poll_render(ui.ctx());
+        self.poll_track(ui.ctx());
+        if self.screen == Screen::Gallery {
+            // Keys and playback belong to the editor; the gallery must not edit a project.
+            self.gallery_screen(ui, full);
+            self.toast(ui, full);
+            return;
+        }
         self.handle_keys(ui.ctx());
         self.advance_playback(ui.ctx());
         let comp = match self.editor.comp() {
@@ -698,7 +881,11 @@ impl MobileApp {
         // The layers live inside the timeline (as in the desktop app), so only the properties
         // panel is a dock or a sheet.
         self.layout.layers_open = false;
-        let ws = layout::resolve(Viewport::new(full.width(), full.height()), &self.layout);
+        let vp = Viewport { width: full.width(), height: full.height(), safe: self.safe };
+        let mut ws = layout::resolve(vp, &self.layout);
+        if self.adapt_to_window(&ws, full.width()) {
+            ws = layout::resolve(vp, &self.layout);
+        }
         let o = full.min;
         ui.painter().rect_filled(full, 0.0, col(DARK.canvas));
 
@@ -718,6 +905,7 @@ impl MobileApp {
             if let Some(t) = ws.tool_bar {
                 self.tool_bar(ui, erect(t, o), t.w > t.h);
             }
+            self.splitters(ui, &ws, o);
             self.sheet_ui(ui, full, Some(&c), ws.kind == WorkspaceKind::Phone);
         } else {
             let r = erect(ws.viewer, o);
@@ -734,6 +922,94 @@ impl MobileApp {
             self.sheet_ui(ui, full, None, ws.kind == WorkspaceKind::Phone);
         }
         self.toast(ui, full);
+    }
+
+    /// Isolates the subject at a point of the composition on the picked layer.
+    fn begin_subject(&mut self, ctx: &egui::Context, layer: u64, x: f64, y: f64) {
+        let result = self.editor.layer_point(layer, x, y).and_then(|p| self.editor.select_subject(layer, p));
+        if let Some(effect) = self.report(result) {
+            self.track = Some(TrackJob { kind: TrackKind::Subject, layer, effect, fraction: 0.0 });
+            self.notify(ctx, "Following the subject through the clip");
+            ctx.request_repaint();
+        }
+    }
+
+    /// Starts the 3D camera tracker on a footage layer.
+    pub(super) fn begin_camera_track(&mut self, ctx: &egui::Context, layer: u64) {
+        let result = self.editor.start_camera_track(layer);
+        if let Some(effect) = self.report(result) {
+            self.track = Some(TrackJob { kind: TrackKind::Camera, layer, effect, fraction: 0.0 });
+            ctx.request_repaint();
+        }
+    }
+
+    /// Stops whichever analysis is running.
+    pub(super) fn stop_track(&mut self, ctx: &egui::Context) {
+        if let Some(t) = self.track.take() {
+            let r = match t.kind {
+                TrackKind::Camera => self.editor.cancel_camera_track(),
+                TrackKind::Subject => self.editor.cancel_subject(),
+            };
+            self.report(r);
+            self.notify(ctx, "Stopped");
+        }
+    }
+
+    /// Asks the user to tap the subject in the picture.
+    pub(super) fn begin_subject_pick(&mut self, layer: u64) {
+        self.pick_subject = Some(layer);
+        self.sheet = None;
+    }
+
+    /// How far the background render has got (`0.0..=1.0`), or `None` when none is running.
+    pub fn rendering(&self) -> Option<f32> {
+        self.job.as_ref().map(|j| j.fraction)
+    }
+
+    /// True when no camera solve or subject isolation is running.
+    pub fn tracking_idle(&self) -> bool {
+        self.track.is_none()
+    }
+
+    pub(super) fn tracking(&self) -> Option<(TrackKind, f32)> {
+        self.track.as_ref().map(|t| (t.kind, t.fraction))
+    }
+
+    fn poll_track(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.track.as_ref().map(|t| (t.kind, t.layer, t.effect)) else { return };
+        let (kind, layer, effect) = t;
+        let progress = match kind {
+            TrackKind::Camera => self.editor.camera_track_progress(layer),
+            TrackKind::Subject => self.editor.subject_progress(layer, effect),
+        };
+        match progress {
+            Ok(p) => {
+                if let Some(job) = self.track.as_mut() {
+                    job.fraction = p.fraction;
+                }
+                if let Some(e) = p.error {
+                    self.track = None;
+                    self.status = Some(e);
+                } else if p.done {
+                    self.track = None;
+                    match kind {
+                        TrackKind::Camera => {
+                            let r = self.editor.add_tracked_camera(layer);
+                            if self.report(r).is_some() {
+                                self.notify(ctx, "Camera solved. A 3D camera now follows the clip.");
+                            }
+                        }
+                        TrackKind::Subject => self.notify(ctx, "Subject isolated. Effects on this layer now see only the subject."),
+                    }
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+            Err(e) => {
+                self.track = None;
+                self.status = Some(e.to_string());
+            }
+        }
     }
 
     fn scoped(&mut self, ui: &mut Ui, rect: ERect, f: impl FnOnce(&mut Self, &mut Ui)) {
@@ -827,19 +1103,28 @@ impl MobileApp {
         let menu = undo.translate(vec2(-b, 0.0));
 
         // The composition name opens the composition switcher.
-        let name_box = ERect::from_min_max(pos2(logo.right() + 4.0, rect.top()), pos2(menu.left() - 4.0, rect.bottom()));
+        let name_box = ERect::from_min_max(pos2(logo.center().x + 24.0, rect.top()), pos2(menu.left() - 4.0, rect.bottom()));
+        // The logo tile is the way back to the project gallery.
+        let home = ERect::from_center_size(logo.center(), vec2(44.0, 44.0));
+        let home_r = ui.interact(home, Id::new("gallery-home"), Sense::click());
+        home_r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Projects"));
+        if home_r.clicked() {
+            self.show_gallery();
+        }
         let r = ui.interact(name_box, Id::new("comp-switcher"), Sense::click());
-        let name = comp.map_or("EffectCraft".to_string(), |c| c.name.clone());
+        let name = comp.map_or("Effectia".to_string(), |c| c.name.clone());
         r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Composition {name}")));
         if r.is_pointer_button_down_on() {
             ui.painter().rect_filled(name_box.shrink2(vec2(0.0, 6.0)), tokens::RADIUS_MD, col(DARK.row_selected));
         }
-        let (text, color, font) = match (&self.status, &self.job) {
-            (Some(msg), _) => (msg.clone(), col(DARK.danger), FontId::new(12.0, FontFamily::Proportional)),
-            (None, Some(j)) => (format!("{}\u{2026}", j.label), col(DARK.warning), FontId::new(13.0, medium())),
-            (None, None) => (name, col(DARK.text_primary), FontId::new(15.0, semibold())),
+        let busy = self.job.is_some() || self.track.is_some();
+        let (text, color, font) = match (&self.status, &self.job, &self.track) {
+            (Some(msg), _, _) => (msg.clone(), col(DARK.danger), FontId::new(12.0, FontFamily::Proportional)),
+            (None, Some(j), _) => (format!("{} {}%\u{2026}", j.label, j.percent()), col(DARK.warning), FontId::new(13.0, medium())),
+            (None, None, Some(t)) => (t.label(), col(DARK.warning), FontId::new(13.0, medium())),
+            (None, None, None) => (name, col(DARK.text_primary), FontId::new(15.0, semibold())),
         };
-        let chev = comp.is_some() && self.status.is_none() && self.job.is_none();
+        let chev = comp.is_some() && self.status.is_none() && !busy;
         let max_w = name_box.width() - 10.0 - if chev { 22.0 } else { 0.0 };
         let galley = ui.painter().layout(text, font, color, max_w.max(40.0));
         let tx = name_box.left() + 10.0;
@@ -848,7 +1133,8 @@ impl MobileApp {
             paint_icon(ui.painter(), Icon::ChevronDown, pos2(tx + galley.size().x + 14.0, rect.center().y), 16.0, col(DARK.text_secondary));
         }
         if r.clicked() {
-            self.sheet = Some(sheets::Sheet::Comps);
+            // While a render runs, the header is its progress bar: tapping it opens the way to stop it.
+            self.sheet = Some(if self.job.is_some() { sheets::Sheet::Export } else { sheets::Sheet::Comps });
         }
 
         let icon = col(DARK.icon);
@@ -873,7 +1159,15 @@ impl MobileApp {
         let foot = ERect::from_min_max(pos2(rest.left(), board.bottom()), rest.max);
         ui.painter().rect_filled(board, 0.0, col(DARK.canvas));
         if let Some(img) = self.paint_frame(ui, board.shrink(tokens::SPACE_2), comp) {
-            self.viewer_touch(ui, img, comp);
+            if self.path_edit.is_some() {
+                self.path_overlay(ui, img, comp);
+                self.path_toolbar(ui, board, comp);
+            } else {
+                self.viewer_touch(ui, img, comp);
+                if self.pick_subject.is_none() {
+                    self.mode_switch(ui, board);
+                }
+            }
         }
         ui.painter().rect_filled(foot, 0.0, col(DARK.surface));
         ui.painter().text(
@@ -883,8 +1177,27 @@ impl MobileApp {
             FontId::new(14.0, FontFamily::Monospace),
             col(DARK.value),
         );
-        let hint = if self.selected(comp).is_some() { "Drag to move the layer" } else { "Pick a layer to move it" };
-        ui.painter().text(foot.center(), Align2::CENTER_CENTER, hint, FontId::new(11.0, FontFamily::Proportional), col(DARK.text_disabled));
+        let picking = self.pick_subject.is_some();
+        let hint = if picking {
+            "Tap the subject  \u{00b7}  tap here to cancel"
+        } else if self.path_edit.is_some() {
+            "Tap an edge to add a point"
+        } else if self.view_mode == ViewMode::Select {
+            if self.selected(comp).is_some() { "Tap to select  \u{00b7}  drag to move" } else { "Tap a layer to select it" }
+        } else if self.selected(comp).is_some() {
+            "Drag to move the layer"
+        } else {
+            "Pick a layer to move it"
+        };
+        let hint_color = if picking { col(DARK.accent) } else { col(DARK.text_disabled) };
+        ui.painter().text(foot.center(), Align2::CENTER_CENTER, hint, FontId::new(12.0, FontFamily::Proportional), hint_color);
+        if picking {
+            let cancel = ui.interact(foot, Id::new("pick-cancel"), Sense::click());
+            cancel.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, "Cancel subject selection"));
+            if cancel.clicked() {
+                self.pick_subject = None;
+            }
+        }
         ui.painter().text(
             pos2(foot.right() - tokens::SPACE_3, foot.center().y),
             Align2::RIGHT_CENTER,
@@ -896,68 +1209,274 @@ impl MobileApp {
 
     /// Selection marker and drag-to-move for the selected layer, on the picture at `img`.
     fn viewer_touch(&mut self, ui: &mut Ui, img: ERect, comp: &CompView) {
-        let resp = ui.interact(img, Id::new("viewer"), Sense::drag());
+        let resp = ui.interact(img, Id::new("viewer"), Sense::click_and_drag());
         resp.widget_info(|| WidgetInfo::labeled(WidgetType::Other, true, "Composition viewer"));
-        let Some(layer) = self.selected(comp).map(|l| (l.id, l.locked, l.name.clone())) else { return };
-        let (id, locked, _) = layer;
-        if let Ok(p) = self.editor.prop(id, "transform/position")
-            && let (Some(x), Some(y)) = (p.value.first(), p.value.get(1))
-        {
-            let at =
-                pos2(img.left() + (*x as f32 / comp.width.max(1) as f32) * img.width(), img.top() + (*y as f32 / comp.height.max(1) as f32) * img.height());
-            if img.expand(12.0).contains(at) {
-                let clip = ui.painter().with_clip_rect(img);
-                let ring = Stroke::new(1.5, col(DARK.accent));
-                clip.circle_stroke(at, 10.0, ring);
-                clip.line_segment([pos2(at.x - 16.0, at.y), pos2(at.x + 16.0, at.y)], ring);
-                clip.line_segment([pos2(at.x, at.y - 16.0), pos2(at.x, at.y + 16.0)], ring);
+        if let Some(layer) = self.pick_subject {
+            ui.painter().rect_stroke(img, 0.0, Stroke::new(2.0, col(DARK.accent)), StrokeKind::Inside);
+            if resp.clicked()
+                && let Some(at) = resp.interact_pointer_pos()
+            {
+                let cx = f64::from((at.x - img.left()) / img.width().max(1.0)) * f64::from(comp.width);
+                let cy = f64::from((at.y - img.top()) / img.height().max(1.0)) * f64::from(comp.height);
+                self.pick_subject = None;
+                self.begin_subject(ui.ctx(), layer, cx, cy);
             }
-        }
-        if locked {
             return;
         }
-        if resp.drag_started() {
-            self.editor.begin_gesture();
-            self.viewer_drag = true;
+        let select = self.view_mode == ViewMode::Select;
+        let comp_point = |at: egui::Pos2| {
+            [
+                f64::from((at.x - img.left()) / img.width().max(1.0)) * f64::from(comp.width),
+                f64::from((at.y - img.top()) / img.height().max(1.0)) * f64::from(comp.height),
+            ]
+        };
+        if select
+            && resp.clicked()
+            && let Some(at) = resp.interact_pointer_pos()
+        {
+            self.tap_select(comp, comp_point(at));
         }
-        if resp.dragged() {
+        let clip = ui.painter().with_clip_rect(img);
+        if let Some(sel) = self.selected(comp) {
+            let to_screen = |p: [f64; 2]| {
+                pos2(img.left() + (p[0] as f32 / comp.width.max(1) as f32) * img.width(), img.top() + (p[1] as f32 / comp.height.max(1) as f32) * img.height())
+            };
+            // The selected layer's outline, so a tap visibly lands.
+            if let Some(q) = crate::pick::layer_outline(self.editor.session(), sel.id) {
+                let pts: Vec<egui::Pos2> = q.iter().map(|p| to_screen(*p)).collect();
+                clip.add(Shape::closed_line(pts, Stroke::new(1.5, col(DARK.accent))));
+            }
+            if let Ok(p) = self.editor.prop(sel.id, "transform/position")
+                && let (Some(x), Some(y)) = (p.value.first(), p.value.get(1))
+            {
+                let at = to_screen([*x, *y]);
+                if img.expand(12.0).contains(at) {
+                    let ring = Stroke::new(1.5, col(DARK.accent));
+                    clip.circle_stroke(at, 10.0, ring);
+                    clip.line_segment([pos2(at.x - 16.0, at.y), pos2(at.x + 16.0, at.y)], ring);
+                    clip.line_segment([pos2(at.x, at.y - 16.0), pos2(at.x, at.y + 16.0)], ring);
+                }
+            }
+        }
+        if resp.drag_started() {
+            let origin = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos());
+            self.viewer_target =
+                if select { origin.and_then(|at| self.drag_target(comp, comp_point(at))) } else { self.selected(comp).filter(|l| !l.locked).map(|l| l.id) };
+            if let Some(id) = self.viewer_target {
+                if self.selected(comp).map(|l| l.id) != Some(id) {
+                    self.sel_key = None;
+                    let r = self.editor.select_layer(id);
+                    self.report(r);
+                }
+                self.editor.begin_gesture();
+                self.viewer_drag = true;
+            }
+        }
+        if resp.dragged()
+            && self.viewer_drag
+            && let Some(id) = self.viewer_target
+        {
             let d = resp.drag_delta();
             let scale = comp.width.max(1) as f32 / img.width().max(1.0);
             let r = self.editor.nudge(id, f64::from(d.x * scale), f64::from(d.y * scale));
             self.report(r);
         }
         if resp.drag_stopped() {
-            self.editor.end_gesture();
+            if self.viewer_drag {
+                self.editor.end_gesture();
+            }
             self.viewer_drag = false;
+            self.viewer_target = None;
+        }
+    }
+
+    /// What a tap on the picture selects: the layer under it; tapping the selected layer again
+    /// takes the one beneath it, and a tap on nothing clears the selection.
+    fn tap_select(&mut self, comp: &CompView, at: [f64; 2]) {
+        let hits = crate::pick::layers_at(self.editor.session(), at);
+        let current = self.selected(comp).map(|l| l.id);
+        let next = match current.and_then(|c| hits.iter().position(|h| *h == c)) {
+            Some(i) => hits.get((i + 1) % hits.len()).copied(),
+            None => hits.first().copied(),
+        };
+        self.sel_key = None;
+        let r = match next {
+            Some(id) => self.editor.select_layer(id),
+            None => self.editor.clear_selection(),
+        };
+        self.report(r);
+    }
+
+    /// The layer a drag that starts at `at` moves: the selected one when it is under the finger,
+    /// else the topmost layer there (which the drag selects). `None` on empty picture.
+    fn drag_target(&mut self, comp: &CompView, at: [f64; 2]) -> Option<u64> {
+        let hits = crate::pick::layers_at(self.editor.session(), at);
+        let current = self.selected(comp).map(|l| l.id);
+        current.filter(|c| hits.contains(c)).or_else(|| hits.first().copied())
+    }
+
+    /// Test and automation hook: a tap at a point of the picture (composition pixels).
+    pub fn tap_picture(&mut self, x: f64, y: f64) {
+        if let Ok(Some(comp)) = self.editor.comp() {
+            self.tap_select(&comp, [x, y]);
+        }
+    }
+
+    /// What a touch on the picture does.
+    pub fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.view_mode = mode;
+    }
+
+    /// The Select / Move switch floating over a corner of the picture.
+    fn mode_switch(&mut self, ui: &mut Ui, board: ERect) {
+        let seg = vec2(72.0, tokens::MIN_TOUCH_TARGET);
+        let pill = ERect::from_min_size(pos2(board.right() - tokens::SPACE_2 - 2.0 * seg.x, board.top() + tokens::SPACE_2), vec2(2.0 * seg.x, seg.y));
+        ui.painter().rect_filled(pill, seg.y / 2.0, col(DARK.surface_overlay).gamma_multiply(0.92));
+        ui.painter().rect_stroke(pill, seg.y / 2.0, Stroke::new(1.0, col(DARK.border)), StrokeKind::Inside);
+        for (i, (mode, label, name)) in [(ViewMode::Select, "Select", "Select mode"), (ViewMode::Move, "Move", "Move mode")].into_iter().enumerate() {
+            let rect = ERect::from_min_size(pill.min + vec2(i as f32 * seg.x, 0.0), seg);
+            let on = self.view_mode == mode;
+            let r = ui.interact(rect, Id::new(("view-mode", i)), Sense::click());
+            r.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, on, name));
+            if on {
+                ui.painter().rect_filled(rect.shrink(3.0), (seg.y - 6.0) / 2.0, col(DARK.accent));
+            }
+            let ink = if on { col(DARK.on_accent) } else { col(DARK.text_secondary) };
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::new(13.0, medium()), ink);
+            if r.clicked() {
+                self.view_mode = mode;
+            }
+        }
+    }
+
+    /// Keeps the panels sensible as the window changes size (split-screen, freeform windows,
+    /// unfolding): a properties panel that was docked would otherwise turn into a sheet over the
+    /// picture when the window shrinks, so it closes, and it comes back when there is room again.
+    /// Returns whether the panel state changed.
+    fn adapt_to_window(&mut self, ws: &layout::Workspace, width: f32) -> bool {
+        let can = ws.kind == WorkspaceKind::Tablet && width >= layout::DOCK_INSPECTOR_MIN_WIDTH;
+        let before = self.can_dock.replace(can);
+        match before {
+            Some(true) if !can => {
+                self.dock_memory = self.layout.inspector_open;
+                self.layout.inspector_open = false;
+                true
+            }
+            Some(false) if can && self.dock_memory => {
+                self.dock_memory = false;
+                self.layout.inspector_open = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Takes the frame the worker finished, if any.
+    fn take_frame(&mut self, ctx: &egui::Context) {
+        let Some(done) = self.worker.as_ref().and_then(RenderWorker::latest) else { return };
+        match done.frame {
+            Some(f) => {
+                if done.stamp.draft && f.width > 0 && f.height > 0 {
+                    // What a pixel costs, so drafts can be sized to keep up (smoothed).
+                    let per_px = done.took.as_secs_f64() * 1e9 / (f64::from(f.width) * f64::from(f.height));
+                    self.draft_cost = Some(self.draft_cost.map_or(per_px, |c| c * 0.5 + per_px * 0.5));
+                }
+                self.upload(ctx, &f);
+            }
+            None => self.status = Some("The frame could not be drawn".into()),
+        }
+        self.shown = Some(done.stamp);
+    }
+
+    /// The size (longest side in pixels) and quality of the frame on screen: `(side, draft)`.
+    pub fn frame_shown(&self) -> Option<(u32, bool)> {
+        self.shown.map(|s| (s.side, s.draft))
+    }
+
+    /// Whether a frame is being drawn in the background (for tests and screenshots to wait on).
+    pub fn render_busy(&self) -> bool {
+        self.worker.as_ref().is_some_and(RenderWorker::busy)
+    }
+
+    /// Asks for the frame the viewer should show now, and shows the newest one that is ready.
+    ///
+    /// Drawing happens on a worker thread, so a slow frame never holds up touches; the last frame
+    /// stays on screen until the next one lands. While the time is moving (scrubbing or playing) or a
+    /// drag is going, frames are drawn small and in draft quality, then once things settle the full
+    /// one follows.
+    fn request_frame(&mut self, ctx: &egui::Context, area: ERect, comp: &CompView) {
+        self.take_frame(ctx);
+        let revision = self.editor.session().revision;
+        let time = (comp.time * 1000.0).round() as i64;
+        let now = Instant::now();
+        let settle = self.settle;
+        // A lone change of time (one step) is drawn in full at once; changes following each other
+        // closely are scrubbing, drawn as drafts until the time has rested for a moment.
+        match self.scrub {
+            Some((last, _, _)) if last == (comp.id, time) => {}
+            Some((last, at, _)) if last.0 == comp.id => {
+                self.scrub = Some(((comp.id, time), now, now.saturating_duration_since(at) < settle + settle));
+            }
+            _ => self.scrub = Some(((comp.id, time), now.checked_sub(settle * 20).unwrap_or(now), false)),
+        }
+        let left = self.scrub.filter(|s| s.2).map(|(_, at, _)| settle.saturating_sub(now.saturating_duration_since(at))).filter(|d| !d.is_zero());
+        let held = self.viewer_drag || self.playing || self.editor.in_gesture() || self.splitting;
+        let moving = held || left.is_some();
+        if !held && let Some(left) = left {
+            ctx.request_repaint_after(left + std::time::Duration::from_millis(20));
+        }
+        let full_side = (area.width().max(area.height()) * ctx.pixels_per_point()).clamp(64.0, 1920.0) as u32;
+        let side = if moving { draft_side(self.draft_cost, full_side, comp.width, comp.height) } else { full_side };
+        let want = Stamp { comp: comp.id, time, revision, side, draft: moving };
+        if self.shown == Some(want) || self.asked == Some(want) {
+            return;
+        }
+        if self.worker.is_none() && !self.worker_tried {
+            self.worker_tried = true;
+            let wake = ctx.clone();
+            self.worker = RenderWorker::start(move || wake.request_repaint());
+        }
+        if self.source.as_ref().map(|s| s.0) != Some(revision) {
+            self.source = Some((revision, self.editor.frame_renderer()));
+        }
+        if let (Some(w), Some((_, src))) = (&self.worker, &self.source)
+            && w.submit(want, comp.time, src.clone())
+        {
+            self.asked = Some(want);
+            return;
+        }
+        // No worker thread: draw here, as before.
+        match self.editor.render(side) {
+            Ok(f) => {
+                self.upload(ctx, &f);
+                self.shown = Some(want);
+            }
+            Err(e) => self.status = Some(e.to_string()),
         }
     }
 
     /// Paints the composition frame and returns the rectangle it occupies.
     fn paint_frame(&mut self, ui: &mut Ui, area: ERect, comp: &CompView) -> Option<ERect> {
-        let key = (comp.id, (comp.time * 1000.0).round() as i64);
-        let rev = self.editor.session().revision as i64;
-        // Dragging and playing render at half size so they keep up; a still frame is full size.
-        let draft = self.viewer_drag || self.playing;
-        let full_side = (area.width().max(area.height()) * ui.ctx().pixels_per_point()).clamp(64.0, 1920.0) as u32;
-        let side = if draft { (full_side / 2).max(64) } else { full_side };
-        let stamp = (key.0 ^ (key.1 as u64).rotate_left(17), rev, side);
-        if self.shown != Some(stamp) {
-            match self.editor.render(side) {
-                Ok(f) => {
-                    self.upload(ui.ctx(), &f);
-                    self.shown = Some(stamp);
-                }
-                Err(e) => self.status = Some(e.to_string()),
-            }
-        }
-        let tex = self.texture.as_ref()?;
+        self.request_frame(ui.ctx(), area, comp);
         let aspect = comp.width.max(1) as f32 / comp.height.max(1) as f32;
         let mut size = vec2(area.width(), area.width() / aspect);
         if size.y > area.height() {
             size = vec2(area.height() * aspect, area.height());
         }
         let r = ERect::from_center_size(area.center(), size);
-        ui.painter().image(tex.id(), r, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        // Until the first frame is drawn the picture area is still there to touch and draw over.
+        match &self.texture {
+            Some(tex) => {
+                ui.painter().image(tex.id(), r, ERect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            }
+            None => {
+                ui.painter().rect_filled(r, 0.0, col(DARK.surface));
+            }
+        }
         Some(r)
     }
 

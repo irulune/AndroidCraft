@@ -44,12 +44,14 @@ enum Act {
     KeyPrev,
     KeyNext,
     More,
+    Track,
     ZoomIn,
     ZoomOut,
     Fit,
     EaseKey,
     LinearKey,
     HoldKey,
+    CurveKey,
     DeleteKey,
     DeselectKey,
 }
@@ -138,10 +140,12 @@ impl MobileApp {
             v.push(Chip { icon: Icon::Diamond, label: "Easy Ease", enabled: true, act: Act::EaseKey, accent: true });
             v.push(Chip { icon: Icon::Diamond, label: "Linear", enabled: true, act: Act::LinearKey, accent: false });
             v.push(Chip { icon: Icon::Diamond, label: "Hold", enabled: true, act: Act::HoldKey, accent: false });
+            v.push(Chip { icon: Icon::Sliders, label: "Curve", enabled: true, act: Act::CurveKey, accent: false });
             v.push(Chip { icon: Icon::Trash, label: "Delete key", enabled: true, act: Act::DeleteKey, accent: false });
             v.push(Chip { icon: Icon::Close, label: "Done", enabled: true, act: Act::DeselectKey, accent: false });
         }
         v.push(Chip { icon: Icon::Plus, label: "Add", enabled: true, act: Act::Add, accent: self.sel_key.is_none() });
+        v.push(Chip { icon: Icon::Track, label: "Track", enabled: sel, act: Act::Track, accent: self.tracking().is_some() });
         v.push(Chip { icon: Icon::Copy, label: "Duplicate", enabled: sel, act: Act::Duplicate, accent: false });
         v.push(Chip { icon: Icon::Scissors, label: "Split", enabled: sel, act: Act::Split, accent: false });
         v.push(Chip { icon: Icon::Trash, label: "Delete", enabled: sel, act: Act::Delete, accent: false });
@@ -163,6 +167,7 @@ impl MobileApp {
         match act {
             Act::Add => self.sheet = Some(Sheet::Add),
             Act::More => self.sheet = Some(Sheet::Layer),
+            Act::Track => self.sheet = Some(Sheet::Track),
             Act::Duplicate => {
                 let r = self.editor.duplicate_selected();
                 if self.report(r).is_some() {
@@ -221,6 +226,7 @@ impl MobileApp {
                 let r = self.editor.key_interpolation("hold");
                 self.report(r);
             }
+            Act::CurveKey => self.open_ease_editor(),
             Act::DeleteKey => {
                 let r = self.editor.delete_keys();
                 if self.report(r).is_some() {

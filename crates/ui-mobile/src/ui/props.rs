@@ -281,6 +281,10 @@ impl MobileApp {
         }
         let open = self.expanded.contains(&node.path);
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), GROUP_H), Sense::hover());
+        if self.reveal.as_deref() == Some(node.path.as_str()) {
+            ui.scroll_to_rect(row, Some(egui::Align::TOP));
+            self.reveal = None;
+        }
         let r = ui.interact(row, Id::new(("group", &node.path)), Sense::click());
         r.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, open, node.name.clone()));
         let fill = if r.is_pointer_button_down_on() { col(DARK.row_selected) } else { col(DARK.header) };
@@ -296,6 +300,24 @@ impl MobileApp {
                 self.expanded.insert(node.path.clone());
             }
         }
+        if let Some(m) = &node.mask {
+            // A mask's mode and inversion at a glance, and the way into its menu.
+            let btn = ERect::from_center_size(pos2(row.right() - tokens::SPACE_3 - 20.0, row.center().y), vec2(44.0, GROUP_H));
+            let menu = ui.interact(btn, Id::new(("mask-menu", node.uid)), Sense::click());
+            menu.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("Options for {}", node.name)));
+            paint_icon(ui.painter(), Icon::More, btn.center(), 18.0, col(DARK.icon));
+            let summary = if m.inverted { format!("{} \u{00b7} Inverted", m.mode) } else { m.mode.clone() };
+            ui.painter().text(
+                pos2(btn.left() - 4.0, row.center().y),
+                Align2::RIGHT_CENTER,
+                summary,
+                FontId::new(12.0, FontFamily::Proportional),
+                col(DARK.text_secondary),
+            );
+            if menu.clicked() {
+                self.sheet = Some(Sheet::Mask { layer, mask: node.uid });
+            }
+        }
         if open {
             for c in &node.children {
                 self.node_rows(ui, layer, c, depth + 1, effect);
@@ -306,6 +328,10 @@ impl MobileApp {
     /// One property: stopwatch, name, and the editor for its type.
     fn prop_row(&mut self, ui: &mut Ui, layer: u64, node: &PropNode, depth: usize, meta: Option<&ParamInfo>) {
         let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), PROP_H), Sense::hover());
+        if self.reveal.as_deref() == Some(node.path.as_str()) {
+            ui.scroll_to_rect(row, Some(egui::Align::Center));
+            self.reveal = None;
+        }
         let animatable = matches!(node.kind.as_str(), "scalar" | "vec2" | "vec3" | "color");
         let x0 = row.left() + 4.0 + depth as f32 * 14.0;
         let mut name_left = x0 + 8.0;
@@ -343,8 +369,8 @@ impl MobileApp {
         let name_rect = ERect::from_min_max(pos2(name_left, row.top()), pos2(ctl_left - 6.0, row.bottom()));
         let nr = ui.interact(name_rect, Id::new(("pname", layer, &node.path)), Sense::click());
         nr.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} options", node.name)));
-        let label = if node.expression { format!("{} =", node.name) } else { node.name.clone() };
-        let color = if node.expression { col(DARK.warning) } else { col(DARK.text_secondary) };
+        let label = if node.expression.is_some() { format!("{} =", node.name) } else { node.name.clone() };
+        let color = if node.expression.is_some() { col(DARK.warning) } else { col(DARK.text_secondary) };
         ui.painter().with_clip_rect(name_rect).text(
             pos2(name_rect.left(), row.center().y),
             Align2::LEFT_CENTER,
@@ -353,7 +379,8 @@ impl MobileApp {
             color,
         );
         if nr.secondary_clicked() || nr.long_touched() || nr.clicked() {
-            self.sheet = Some(Sheet::Prop { layer, path: node.path.clone(), name: node.name.clone(), animated: node.animated() });
+            self.sheet =
+                Some(Sheet::Prop { layer, path: node.path.clone(), name: node.name.clone(), animated: node.animated(), expression: node.expression.clone() });
         }
 
         let area = ERect::from_min_max(pos2(ctl_left, row.top()), pos2(row.right() - tokens::SPACE_3, row.bottom()));
@@ -424,13 +451,40 @@ impl MobileApp {
                     self.sheet = Some(Sheet::Input { kind, value: current, title: node.name.clone(), multiline: node.kind == "text" });
                 }
             }
+            "path" => {
+                let rect = ERect::from_min_max(pos2(area.left(), row.top() + 7.0), pos2(area.right(), row.bottom() - 7.0));
+                if value_button(ui, rect, Id::new(("path", layer, &node.path)), "Edit points", &format!("{} edit points", node.name)).clicked() {
+                    self.edit_points(layer, node.group, node.uid);
+                }
+            }
+            "gradient" => {
+                // The gradient itself is the button.
+                let rect = ERect::from_min_max(pos2(area.left().max(area.right() - 150.0), row.top() + 8.0), pos2(area.right(), row.bottom() - 8.0));
+                let r = ui.interact(rect, Id::new(("gradient", layer, &node.path)), Sense::click());
+                r.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, format!("{} edit gradient", node.name)));
+                if let Some(g) = crate::gradient::GradientData::from_json(&node.value) {
+                    sheets::paint_gradient(ui.painter(), rect, &g);
+                }
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    Stroke::new(1.0, if r.is_pointer_button_down_on() { col(DARK.accent) } else { col(DARK.border) }),
+                    StrokeKind::Outside,
+                );
+                if r.clicked() {
+                    self.edit_gradient(layer, &format!("@{}", node.uid), &node.name);
+                }
+            }
+            "layer" => {
+                let current = node.value.as_u64();
+                let text = self.editor.comp().ok().flatten().map_or_else(|| "None".to_string(), |c| sheets::layer_label(&c, current));
+                let rect = ERect::from_min_max(pos2(area.left(), row.top() + 7.0), pos2(area.right(), row.bottom() - 7.0));
+                if value_button(ui, rect, Id::new(("layer-link", layer, &node.path)), &text, &node.name).clicked() {
+                    self.sheet = Some(Sheet::LayerLink { layer, path: node.path.clone(), name: node.name.clone() });
+                }
+            }
             other => {
-                let what = match other {
-                    "path" => "Shape path",
-                    "gradient" => "Gradient",
-                    "layer" => "Layer link",
-                    _ => "Not editable here",
-                };
+                let what = if other.is_empty() { "" } else { "Not editable here" };
                 ui.painter().text(
                     pos2(area.right(), row.center().y),
                     Align2::RIGHT_CENTER,

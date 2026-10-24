@@ -113,6 +113,12 @@ const BOTTOM_BAR_H: f32 = 56.0;
 const RAIL_W: f32 = 56.0;
 const LAYERS_W: f32 = 280.0;
 const INSPECTOR_W: f32 = 320.0;
+/// Narrowest a docked side panel can be dragged to.
+pub const DOCK_MIN_WIDTH: f32 = 220.0;
+/// The viewer never gets narrower than this because a side panel was dragged wide.
+const VIEWER_MIN_WIDTH: f32 = 320.0;
+/// Thickness of the touch band over the edge between a side panel and the viewer.
+pub const SPLITTER_HIT: f32 = 20.0;
 
 /// Classifies a viewport. Tablet layouts need both a roomy width and height.
 pub fn classify(width: f32, height: f32) -> WorkspaceKind {
@@ -134,18 +140,77 @@ pub struct LayoutState {
     pub timeline_fraction: f32,
     pub layers_open: bool,
     pub inspector_open: bool,
+    /// Width wanted for the docked layers panel (clamped to what fits).
+    pub layers_width: f32,
+    /// Width wanted for the docked inspector (clamped to what fits).
+    pub inspector_width: f32,
 }
 
 impl Default for LayoutState {
     fn default() -> Self {
-        LayoutState { timeline_open: true, timeline_fraction: 0.38, layers_open: false, inspector_open: false }
+        LayoutState {
+            timeline_open: true,
+            timeline_fraction: 0.38,
+            layers_open: false,
+            inspector_open: false,
+            layers_width: LAYERS_W,
+            inspector_width: INSPECTOR_W,
+        }
     }
+}
+
+/// The panel sizes a person has dragged, which are worth remembering between runs.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PanelSizes {
+    pub timeline_fraction: f32,
+    pub layers_width: f32,
+    pub inspector_width: f32,
 }
 
 impl LayoutState {
     /// Tablet default: both side panels open.
     pub fn tablet() -> LayoutState {
         LayoutState { layers_open: true, inspector_open: true, ..LayoutState::default() }
+    }
+
+    /// The sizes worth saving.
+    pub fn sizes(&self) -> PanelSizes {
+        PanelSizes { timeline_fraction: self.timeline_fraction, layers_width: self.layers_width, inspector_width: self.inspector_width }
+    }
+
+    /// Takes saved sizes back, ignoring anything that is not a sane number.
+    pub fn set_sizes(&mut self, s: PanelSizes) {
+        if s.timeline_fraction.is_finite() {
+            self.timeline_fraction = s.timeline_fraction.clamp(0.0, 1.0);
+        }
+        if s.layers_width.is_finite() {
+            self.layers_width = s.layers_width.clamp(DOCK_MIN_WIDTH, 2000.0);
+        }
+        if s.inspector_width.is_finite() {
+            self.inspector_width = s.inspector_width.clamp(DOCK_MIN_WIDTH, 2000.0);
+        }
+    }
+
+    /// Drags the top edge of the timeline so it is `height` tall (the layout clamps it to what fits).
+    pub fn resize_timeline(&mut self, ws: &Workspace, height: f32) {
+        let room = ws.viewer.h + ws.timeline.map_or(0.0, |t| t.h);
+        if room > 1.0 && height.is_finite() {
+            self.timeline_fraction = (height / room).clamp(0.0, 1.0);
+        }
+    }
+
+    /// Drags the layers panel's inner edge to `width`.
+    pub fn resize_layers(&mut self, width: f32) {
+        if width.is_finite() {
+            self.layers_width = width.clamp(DOCK_MIN_WIDTH, 2000.0);
+        }
+    }
+
+    /// Drags the inspector's inner edge to `width`.
+    pub fn resize_inspector(&mut self, width: f32) {
+        if width.is_finite() {
+            self.inspector_width = width.clamp(DOCK_MIN_WIDTH, 2000.0);
+        }
     }
 }
 
@@ -166,6 +231,12 @@ pub struct Workspace {
     pub timeline: Option<Rect>,
     pub layers: Option<Rect>,
     pub inspector: Option<Rect>,
+    /// Where a finger grabs to resize the docked layers panel (a band over its inner edge).
+    pub layers_splitter: Option<Rect>,
+    /// Where a finger grabs to resize the docked inspector.
+    pub inspector_splitter: Option<Rect>,
+    /// Whether the timeline's height can be dragged here (not in a short landscape window).
+    pub timeline_resizable: bool,
     /// Layers shown as a sheet that floats over the workspace (only when not docked).
     pub layers_sheet: Option<Rect>,
     /// Inspector shown as a sheet that floats over the workspace (only when not docked).
@@ -243,13 +314,20 @@ pub fn resolve(vp: Viewport, state: &LayoutState) -> Workspace {
             let mut body = rest;
             let mut layers = None;
             let mut inspector = None;
+            let fit = |want: f32, room: f32| {
+                let want = if want.is_finite() { want } else { LAYERS_W };
+                want.clamp(DOCK_MIN_WIDTH, (room * 0.4).max(DOCK_MIN_WIDTH))
+            };
             if state.layers_open && width >= DOCK_LAYERS_MIN_WIDTH {
-                let (l, b) = body.split_left(LAYERS_W);
+                let (l, b) = body.split_left(fit(state.layers_width, body.w));
                 layers = Some(l);
                 body = b;
             }
             if state.inspector_open && width >= DOCK_INSPECTOR_MIN_WIDTH {
-                let (i, b) = body.split_right(INSPECTOR_W);
+                // Whatever the layers panel left, minus a viewer that stays usable.
+                let room = (body.w - VIEWER_MIN_WIDTH).max(DOCK_MIN_WIDTH);
+                let w = fit(state.inspector_width, body.w).min(room);
+                let (i, b) = body.split_right(w);
                 inspector = Some(i);
                 body = b;
             }
@@ -269,7 +347,27 @@ pub fn resolve(vp: Viewport, state: &LayoutState) -> Workspace {
     let inspector_sheet = if want_inspector_sheet { Some(sheet(kind, side_region, false)) } else { None };
     let layers_sheet = if want_layers_sheet && !(single_sheet && want_inspector_sheet) { Some(sheet(kind, side_region, true)) } else { None };
 
-    Workspace { kind, area, top_bar, tool_bar, viewer, transport, timeline, layers, inspector, layers_sheet, inspector_sheet }
+    let band = |x: f32| Rect::new(x - SPLITTER_HIT / 2.0, body.y, SPLITTER_HIT, body.h);
+    let layers_splitter = layers.map(|l| band(l.right()));
+    let inspector_splitter = inspector.map(|i| band(i.x));
+    let timeline_resizable = timeline.is_some() && kind != WorkspaceKind::PhoneLandscape;
+
+    Workspace {
+        kind,
+        area,
+        top_bar,
+        tool_bar,
+        viewer,
+        transport,
+        timeline,
+        layers,
+        inspector,
+        layers_splitter,
+        inspector_splitter,
+        timeline_resizable,
+        layers_sheet,
+        inspector_sheet,
+    }
 }
 
 #[cfg(test)]
@@ -327,7 +425,7 @@ mod tests {
             for fraction in [0.0, 0.38, 1.0] {
                 for layers_open in [false, true] {
                     for inspector_open in [false, true] {
-                        v.push(LayoutState { timeline_open, timeline_fraction: fraction, layers_open, inspector_open });
+                        v.push(LayoutState { timeline_open, timeline_fraction: fraction, layers_open, inspector_open, ..LayoutState::default() });
                     }
                 }
             }
@@ -438,6 +536,88 @@ mod tests {
         let a = ws(1180.0, 820.0, LayoutState::tablet());
         let b = ws(1180.0, 820.0, LayoutState::tablet());
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn docked_panels_take_the_width_they_were_dragged_to() {
+        let mut state = LayoutState::tablet();
+        state.resize_layers(360.0);
+        state.resize_inspector(400.0);
+        let w = ws(1376.0, 1032.0, state);
+        assert_eq!(w.layers.map(|r| r.w), Some(360.0));
+        assert_eq!(w.inspector.map(|r| r.w), Some(400.0));
+        // The grab bands straddle the panels' inner edges and stay inside the window.
+        let (ls, is) = (w.layers_splitter.unwrap_or_default(), w.inspector_splitter.unwrap_or_default());
+        assert!((ls.x + ls.w / 2.0 - 360.0).abs() < EPS && (is.x + is.w / 2.0 - (1376.0 - 400.0)).abs() < EPS);
+        assert!(ls.w >= SPLITTER_HIT - EPS && is.w >= SPLITTER_HIT - EPS);
+    }
+
+    #[test]
+    fn dragging_a_panel_too_wide_or_too_narrow_is_held_in_range() {
+        let mut state = LayoutState::tablet();
+        state.resize_layers(5.0);
+        state.resize_inspector(5000.0);
+        let w = ws(1376.0, 1032.0, state);
+        let (l, i) = (w.layers.map_or(0.0, |r| r.w), w.inspector.map_or(0.0, |r| r.w));
+        assert!((l - DOCK_MIN_WIDTH).abs() < EPS, "{l}");
+        assert!((DOCK_MIN_WIDTH..=1376.0 * 0.4 + EPS).contains(&i), "{i}");
+        assert!(w.viewer.w >= VIEWER_MIN_WIDTH - EPS, "viewer {:?}", w.viewer);
+    }
+
+    #[test]
+    fn the_viewer_stays_usable_when_both_panels_are_wide_and_the_window_shrinks() {
+        let mut state = LayoutState::tablet();
+        state.resize_layers(2000.0);
+        state.resize_inspector(2000.0);
+        let mut width = 960.0;
+        while width <= 1400.0 {
+            let w = ws(width, 800.0, state);
+            assert!(w.viewer.w >= VIEWER_MIN_WIDTH - EPS, "{width}: viewer {:?}", w.viewer);
+            for (i, a) in w.docked().iter().enumerate() {
+                for b in &w.docked()[i + 1..] {
+                    assert!(!a.overlaps(b), "{width}: {a:?} overlaps {b:?}");
+                }
+            }
+            width += 23.0;
+        }
+    }
+
+    #[test]
+    fn dragging_the_timeline_edge_sets_its_height() {
+        let mut state = LayoutState::default();
+        let w = ws(390.0, 844.0, state);
+        assert!(w.timeline_resizable);
+        let want = w.timeline.map_or(0.0, |t| t.h) + 30.0;
+        state.resize_timeline(&w, want);
+        let after = ws(390.0, 844.0, state).timeline.map_or(0.0, |t| t.h);
+        assert!((after - want).abs() < 1.0, "wanted {want}, got {after}");
+        // Dragged beyond what leaves a picture, it stops at the limit rather than covering it.
+        state.resize_timeline(&w, 5000.0);
+        let most = ws(390.0, 844.0, state);
+        assert!(most.viewer.h >= 844.0 * 0.4, "{:?}", most.viewer);
+    }
+
+    #[test]
+    fn a_short_landscape_window_keeps_its_timeline_height() {
+        let w = ws(900.0, 400.0, LayoutState::default());
+        assert!(!w.timeline_resizable);
+        let closed = ws(390.0, 844.0, LayoutState { timeline_open: false, ..LayoutState::default() });
+        assert!(!closed.timeline_resizable && closed.timeline.is_none());
+    }
+
+    #[test]
+    fn saved_sizes_round_trip_and_garbage_is_ignored() {
+        let mut a = LayoutState::default();
+        a.resize_layers(300.0);
+        a.resize_inspector(350.0);
+        a.timeline_fraction = 0.3;
+        let json = serde_json::to_string(&a.sizes()).unwrap_or_default();
+        let mut b = LayoutState::default();
+        b.set_sizes(serde_json::from_str(&json).unwrap_or(b.sizes()));
+        assert_eq!((b.layers_width, b.inspector_width, b.timeline_fraction), (300.0, 350.0, 0.3));
+        b.set_sizes(PanelSizes { timeline_fraction: f32::NAN, layers_width: f32::INFINITY, inspector_width: -4.0 });
+        assert_eq!((b.layers_width, b.timeline_fraction), (300.0, 0.3), "non-finite values change nothing");
+        assert_eq!(b.inspector_width, DOCK_MIN_WIDTH);
     }
 
     #[test]

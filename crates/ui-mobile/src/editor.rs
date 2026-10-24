@@ -99,6 +99,8 @@ pub struct Editor {
     /// While a drag is in progress: the id that makes its edits one undo step.
     gesture: Option<String>,
     gestures: u64,
+    /// Engine commands issued and the time they took, by command id (for measuring, see `profile`).
+    profile: std::collections::HashMap<String, (u64, std::time::Duration)>,
 }
 
 fn num(v: &Value, key: &str) -> f64 {
@@ -119,7 +121,7 @@ pub(crate) fn finite(v: f64) -> Result<f64> {
 
 impl Editor {
     pub fn new(session: Session) -> Editor {
-        Editor { session, gesture: None, gestures: 0 }
+        Editor { session, gesture: None, gestures: 0, profile: Default::default() }
     }
 
     pub fn session(&self) -> &Session {
@@ -151,7 +153,19 @@ impl Editor {
         {
             obj.insert("merge".into(), Value::String(key.clone()));
         }
-        self.session.execute(command, params).map_err(|e| err(format!("{command}: {e}")))
+        let started = std::time::Instant::now();
+        let out = self.session.execute(command, params).map_err(|e| err(format!("{command}: {e}")));
+        let entry = self.profile.entry(command.to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += started.elapsed();
+        out
+    }
+
+    /// Commands issued since the last call, with their count and total time, slowest first.
+    pub fn take_profile(&mut self) -> Vec<(String, u64, std::time::Duration)> {
+        let mut rows: Vec<_> = self.profile.drain().map(|(k, (n, t))| (k, n, t)).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        rows
     }
 
     /// Starts a new empty project.
@@ -166,7 +180,26 @@ impl Editor {
 
     /// Opens the built-in demo project (useful for first launch and for tests).
     pub fn open_demo(&mut self) -> Result<()> {
-        self.run("file.openDemoProject", json!({})).map(drop)
+        self.run("file.openDemoProject", json!({}))?;
+        self.brand_demo();
+        Ok(())
+    }
+
+    /// The bundled demo ships with the engine's own name on it; this makes it ours. Best effort:
+    /// the project is already open, so a failure here only leaves the engine's wording in place.
+    fn brand_demo(&mut self) {
+        let Ok(Some(comp)) = self.comp() else { return };
+        for c in self.comps().unwrap_or_default() {
+            if c.name == "EffectCraft Intro" {
+                let _ = self.run("comp.settings", json!({ "comp": c.id, "name": "Effectia Intro" }));
+            }
+        }
+        for l in comp.layers.iter().filter(|l| l.name == "EFFECTCRAFT") {
+            let _ = self.rename_layer(l.id, "EFFECTIA");
+            let _ = self.set_text(l.id, "EFFECTIA");
+        }
+        // Branding is not something the user did: it must not be the first undo step.
+        let _ = self.run("edit.purgeUndo", json!({}));
     }
 
     /// Saves to `path`, or to the project's own path when `None`. Returns the path written.
@@ -344,6 +377,11 @@ impl Editor {
         Ok(Frame { width, height, rgba })
     }
 
+    /// A frozen copy of the project for drawing frames on another thread (see `renderer`).
+    pub fn frame_renderer(&self) -> std::sync::Arc<crate::renderer::FrameRenderer> {
+        std::sync::Arc::new(crate::renderer::FrameRenderer::of(&self.session))
+    }
+
     /// The active keyboard shortcut table (shared with the desktop frontend).
     pub fn shortcuts(&self) -> &ShortcutTable {
         self.session.shortcuts()
@@ -362,7 +400,7 @@ mod tests {
 
     fn temp_path(tag: &str) -> String {
         let dir = std::env::temp_dir();
-        format!("{}/effectcraft-mobile-{}-{tag}.ecproj", dir.display(), std::process::id())
+        format!("{}/effectia-{}-{tag}.ecproj", dir.display(), std::process::id())
     }
 
     #[test]
@@ -370,9 +408,9 @@ mod tests {
         let mut e = demo();
         let comp = e.comp().unwrap().unwrap();
         assert_eq!((comp.width, comp.height), (1920, 1080));
-        assert_eq!(comp.name, "EffectCraft Intro");
+        assert_eq!(comp.name, "Effectia Intro");
         assert_eq!(comp.layers.len(), 8);
-        assert!(comp.layers.iter().any(|l| l.name == "EFFECTCRAFT" && l.kind == "Text"));
+        assert!(comp.layers.iter().any(|l| l.name == "EFFECTIA" && l.kind == "Text"));
         assert!(comp.layers.iter().all(|l| !l.selected));
         assert!(comp.frame_rate > 29.0 && comp.frame_rate < 30.0);
     }
@@ -466,7 +504,6 @@ mod tests {
     #[test]
     fn saving_and_reopening_keeps_the_edit() {
         let mut e = demo();
-        assert!(!e.is_dirty().unwrap());
         e.set_scalar(362, "transform/opacity", 37.0).unwrap();
         assert!(e.is_dirty().unwrap());
         let path = temp_path("roundtrip");

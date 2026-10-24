@@ -1,4 +1,4 @@
-//! Touch-first EffectCraft frontend model (layer 5).
+//! Touch-first Effectia frontend model (layer 5).
 //!
 //! This crate holds the parts of the mobile / tablet interface that are pure logic and so can be
 //! tested without a window: the design tokens ([`tokens`]), the responsive workspace layout
@@ -7,9 +7,17 @@
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod browser;
+pub mod curve;
 pub mod editor;
+pub mod gallery;
+pub mod gradient;
 pub mod keys;
 pub mod layout;
 pub mod ops;
+pub mod pathedit;
+pub mod pick;
+pub mod platform;
+pub mod renderer;
 pub mod tokens;
 pub mod ui;

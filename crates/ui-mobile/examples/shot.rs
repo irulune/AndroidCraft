@@ -1,12 +1,12 @@
 //! Renders the touch workspace to a PPM image on the CPU (no GPU needed), for looking at layouts.
 //!
-//! `cargo run -p effectcraft-ui-mobile --example shot -- <width> <height> <ppp> <out.ppm> [steps]`
-//! where steps is a comma list of: `select:<layer id>`, `time:<seconds>`, `props`, `notimeline`.
+//! `cargo run -p effectia-ui-mobile --example shot -- <width> <height> <ppp> <out.ppm> [steps]`
+//! where steps is a `;` list of: `mask:<rect|ellipse>`, `picker:<folder>`, `points`, `gradient`, `ease:<drag|->`, `select:<layer id>`, `time:<seconds>`, `props`, `notimeline`.
 
 use std::collections::HashMap;
 
-use effectcraft_ui_mobile::editor::Editor;
-use effectcraft_ui_mobile::ui::{MobileApp, apply_theme};
+use effectia_ui_mobile::editor::Editor;
+use effectia_ui_mobile::ui::{MobileApp, apply_theme};
 use egui::epaint::{ImageData, Primitive};
 use egui::{Color32, Event, Pos2, RawInput, Rect, TextureId, vec2};
 
@@ -28,16 +28,104 @@ fn main() {
     let mut editor = Editor::new(effectcraft_host::session());
     editor.open_demo().ok();
     let mut app = MobileApp::new(editor);
+    // `picker:<dir>` browses that folder as the phone's shared storage.
+    if let Some(dir) = steps.split(';').find_map(|s| s.strip_prefix("picker:")) {
+        use effectia_ui_mobile::platform::{Desktop, Needs, Root};
+        app = app.with_storage(std::env::temp_dir().join("effectia-shot-app")).with_platform(Desktop::with_roots(vec![Root::new(
+            "Samples",
+            dir,
+            Needs::Nothing,
+        )]));
+    }
     if w >= 600.0 && h >= 500.0 {
         app.layout.inspector_open = true;
     }
     for s in steps.split(';').filter(|s| !s.is_empty()) {
         match s.split_once(':') {
+            Some(("media", path)) => {
+                // A fresh project holding one clip, selected.
+                app.editor.new_project().ok();
+                app.editor.new_comp("Clip", 1280, 720, 24.0, 2.0).ok();
+                if let Ok(layer) = app.editor.import_and_add(path) {
+                    app.editor.select_layer(layer).ok();
+                }
+            }
+            Some(("ease", preset)) => {
+                // A layer fading 100 -> 20 over a second, its first key selected, the ease editor open.
+                app.editor.new_project().ok();
+                app.editor.new_comp("Fade", 1280, 720, 24.0, 4.0).ok();
+                let layer = app.editor.add_layer(effectia_ui_mobile::ops::NewLayer::Solid).unwrap_or(0);
+                app.editor.set_time(0.0).ok();
+                app.editor.toggle_key(layer, "transform/opacity").ok();
+                app.editor.set_time(1.0).ok();
+                app.editor.toggle_key(layer, "transform/opacity").ok();
+                app.editor.set_scalar(layer, "transform/opacity", 20.0).ok();
+                app.editor.select_layer(layer).ok();
+                app.select_keyframe(layer, "transform/opacity", 0.0);
+                app.open_sheet("ease");
+                if preset == "drag" {
+                    app.drag_ease_handle(true, 0.62, 1.25);
+                    app.drag_ease_handle(false, 0.35, 0.1);
+                }
+            }
+            Some(("expression", path)) => {
+                let layer = app.editor.comp().ok().flatten().and_then(|c| c.layers.iter().find(|l| l.selected).map(|l| l.id));
+                if let Some(layer) = layer {
+                    app.open_expression_editor(layer, path);
+                }
+            }
+            Some(("mask", shape)) => {
+                // A mask on the selected layer, its group open in the property list.
+                let layer = app.editor.comp().ok().flatten().and_then(|c| c.layers.iter().find(|l| l.selected).map(|l| l.id));
+                if let Some(layer) = layer {
+                    let shape = if shape == "ellipse" { effectia_ui_mobile::ops::MaskShape::Ellipse } else { effectia_ui_mobile::ops::MaskShape::Rectangle };
+                    if let Ok(mask) = app.editor.add_mask(layer, shape) {
+                        app.show_new_mask(layer, mask);
+                    }
+                }
+            }
+            Some(("points", _)) => {
+                // Point editing on the selected layer's first mask (add one with `mask:` first).
+                let layer = app.editor.comp().ok().flatten().and_then(|c| c.layers.iter().find(|l| l.selected).map(|l| l.id));
+                if let Some(layer) = layer
+                    && let Ok(tree) = app.editor.layer_tree(layer, 6)
+                    && let Some(m) = tree.masks().first()
+                    && let Some(p) = m.path_prop()
+                {
+                    app.edit_points(layer, m.uid, p.uid);
+                }
+            }
+            Some(("gradient", _)) => {
+                // A star with a three-stop gradient fill, its editor open on the middle stop.
+                app.editor.new_project().ok();
+                app.editor.new_comp("Gradient", 1280, 720, 24.0, 2.0).ok();
+                if let Ok(layer) = app.editor.add_layer(effectia_ui_mobile::ops::NewLayer::Star) {
+                    app.editor.select_layer(layer).ok();
+                    app.editor.add_gradient(layer, false).ok();
+                    if let Ok(tree) = app.editor.layer_tree(layer, 8)
+                        && let Some(n) = tree.find_kind("gradient")
+                    {
+                        let path = format!("@{}", n.uid);
+                        if let Ok(mut g) = app.editor.gradient(layer, &path) {
+                            let i = g.add(effectia_ui_mobile::gradient::Track::Color, 0.45);
+                            g.set_rgb(0, [1.0, 0.35, 0.2]);
+                            g.set_rgb(i, [0.95, 0.85, 0.2]);
+                            g.set_rgb(2, [0.2, 0.3, 0.9]);
+                            g.opacities = vec![(0.0, 1.0), (0.8, 1.0), (1.0, 0.25)];
+                            app.editor.set_gradient(layer, &path, &g).ok();
+                            app.edit_gradient(layer, &path, "Colors");
+                        }
+                    }
+                }
+            }
             Some(("select", id)) => {
                 app.editor.select_layer(id.parse().unwrap_or(0)).ok();
             }
             Some(("time", t)) => {
                 app.editor.set_time(t.parse().unwrap_or(0.0)).ok();
+            }
+            Some(("picker", _)) => {
+                app.open_sheet("media");
             }
             Some(("sheet", name)) => {
                 app.open_sheet(name);
@@ -51,6 +139,22 @@ fn main() {
                 }
             }
             Some(("expand", path)) => app.expand(path),
+            Some(("storage", dir)) => app = app.with_storage(dir),
+            Some(("roots", list)) => {
+                // roots:Label=/path|Label=/path  (readable folders for the media picker)
+                let roots = list
+                    .split('|')
+                    .filter_map(|e| e.split_once('='))
+                    .map(|(l, p)| effectia_ui_mobile::platform::Root::new(l, p, effectia_ui_mobile::platform::Needs::Nothing))
+                    .collect();
+                app = app.with_platform(effectia_ui_mobile::platform::Desktop::with_roots(roots));
+            }
+            Some(("saveas", name)) => {
+                // Saves the open project into storage/projects/<name>.ecproj.
+                let dir = app.storage.join("projects");
+                std::fs::create_dir_all(&dir).ok();
+                app.editor.save(Some(&dir.join(format!("{name}.ecproj")).to_string_lossy())).ok();
+            }
             Some(("key", spec)) => {
                 // key:<layer>:<path>:<seconds> adds a keyframe there.
                 let parts: Vec<&str> = spec.split(':').collect();
@@ -66,6 +170,9 @@ fn main() {
             }
             _ => match s {
                 "fxtab" => app.show_panel(true),
+                "gallery" => {
+                    app.show_gallery();
+                }
                 "props" => app.layout.inspector_open = true,
                 "notimeline" => app.layout.timeline_open = false,
                 _ => {}
@@ -75,7 +182,12 @@ fn main() {
 
     let mut textures: HashMap<TextureId, Tex> = HashMap::new();
     let mut last = None;
-    for _ in 0..4 {
+    let mut settle = 0;
+    for frame in 0..800 {
+        if frame > 0 && (app.gallery_busy() || app.sheet_open() || app.render_busy()) {
+            // Gallery previews are drawn on a worker; give it time.
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
         let raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(w, h))),
             viewports: std::iter::once((egui::ViewportId::ROOT, egui::ViewportInfo { native_pixels_per_point: Some(ppp), ..Default::default() })).collect(),
@@ -106,6 +218,10 @@ fn main() {
         }
         full.textures_delta.clear();
         last = Some((ctx.tessellate(full.shapes, full.pixels_per_point), full.pixels_per_point));
+        settle = if app.gallery_busy() || app.render_busy() || (app.sheet_open() && frame < 40) { 0 } else { settle + 1 };
+        if settle >= 4 {
+            break;
+        }
     }
     let Some((prims, ppp)) = last else { return };
     let (pw, ph) = ((w * ppp) as usize, (h * ppp) as usize);

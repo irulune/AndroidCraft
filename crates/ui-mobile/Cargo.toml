@@ -1,6 +1,6 @@
 [package]
-name = "effectcraft-ui-mobile"
-description = "EffectCraft touch-first frontend model: design tokens, responsive phone/tablet workspace layout, external-keyboard shortcut routing"
+name = "effectia-ui-mobile"
+description = "Effectia touch-first frontend model: design tokens, responsive phone/tablet workspace layout, external-keyboard shortcut routing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,9 +12,12 @@ workspace = true
 [dependencies]
 effectcraft-host = { workspace = true }
 effectcraft-engine = { workspace = true }
+effectcraft-project = { workspace = true }
 effectcraft-color = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 egui = { workspace = true }
+image = { workspace = true, features = ["webp", "gif", "bmp"] }
 
 [dev-dependencies]
 

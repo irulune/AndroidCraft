@@ -13,6 +13,10 @@ fn err(msg: impl Into<String>) -> EditorError {
     EditorError(msg.into())
 }
 
+fn num(v: &Value, key: &str) -> f64 {
+    v.get(key).and_then(Value::as_f64).unwrap_or(0.0)
+}
+
 fn text(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
@@ -170,11 +174,111 @@ pub struct PropNode {
     pub enabled: bool,
     /// Effect id, for an effect's group.
     pub effect: Option<String>,
-    pub expression: bool,
+    /// The expression's text, when the property has one.
+    pub expression: Option<String>,
     pub children: Vec<PropNode>,
+    /// The engine's id for this node (a mask's id is what the mask commands take).
+    pub uid: u64,
+    /// Set on a mask's group.
+    pub mask: Option<MaskState>,
+    /// The id of the group this node sits in (0 at the top). A path property's group is the mask
+    /// or shape path the point-editing commands take.
+    pub group: u64,
+}
+
+/// The mode and inversion of one mask.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskState {
+    pub mode: String,
+    pub inverted: bool,
+}
+
+/// One side's ease for each dimension of a keyframe: `(speed, influence in percent)`.
+pub type Eases = Vec<(f64, f64)>;
+
+/// A keyframe as the curve editor needs it: where it is, its value and how it eases.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyEase {
+    /// Layer seconds.
+    pub time: f64,
+    /// One number per dimension (a spatial property has its full position here).
+    pub value: Vec<f64>,
+    /// A spatial property is eased along its path as one dimension.
+    pub spatial: bool,
+    pub in_ease: Eases,
+    pub out_ease: Eases,
+    /// `linear`, `bezier`, `hold`.
+    pub interp_in: String,
+    pub interp_out: String,
+    pub units: String,
+}
+
+impl KeyEase {
+    /// The number of eased dimensions.
+    pub fn dims(&self) -> usize {
+        self.in_ease.len().max(self.out_ease.len()).max(1)
+    }
+}
+
+/// A mask or shape path: its points and the handles at each.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PathData {
+    pub closed: bool,
+    pub vertices: Vec<[f64; 2]>,
+    /// Handle offsets from each vertex, going in and going out.
+    pub ins: Vec<[f64; 2]>,
+    pub outs: Vec<[f64; 2]>,
+}
+
+impl PathData {
+    fn from_json(v: &Value) -> Option<PathData> {
+        let v = v.get("v")?;
+        let pts = |k: &str| -> Vec<[f64; 2]> {
+            v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(|p| Some([p.get(0)?.as_f64()?, p.get(1)?.as_f64()?])).collect()).unwrap_or_default()
+        };
+        let vertices = pts("vertices");
+        let n = vertices.len();
+        let (mut ins, mut outs) = (pts("in_tangents"), pts("out_tangents"));
+        ins.resize(n, [0.0; 2]);
+        outs.resize(n, [0.0; 2]);
+        Some(PathData { closed: v.get("closed").and_then(Value::as_bool).unwrap_or(false), vertices, ins, outs })
+    }
+
+    /// A vertex with handles is smooth; one without is a corner.
+    pub fn is_smooth(&self, i: usize) -> bool {
+        self.ins.get(i).is_some_and(|t| *t != [0.0; 2]) || self.outs.get(i).is_some_and(|t| *t != [0.0; 2])
+    }
+}
+
+/// The ways a mask combines with the masks above it.
+pub const MASK_MODES: [&str; 7] = ["None", "Add", "Subtract", "Intersect", "Lighten", "Darken", "Difference"];
+
+/// The shapes a new mask can start as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaskShape {
+    Rectangle,
+    Ellipse,
 }
 
 impl PropNode {
+    /// The masks of a layer's tree, in stacking order.
+    pub fn masks(&self) -> Vec<&PropNode> {
+        self.find("masks").map(|m| m.children.iter().filter(|c| c.mask.is_some()).collect()).unwrap_or_default()
+    }
+
+    /// The first property of this kind anywhere below (`gradient`, `path`, ...).
+    pub fn find_kind(&self, kind: &str) -> Option<&PropNode> {
+        if self.kind == kind {
+            return Some(self);
+        }
+        self.children.iter().find_map(|c| c.find_kind(kind))
+    }
+
+    /// A mask's or shape path's own path property.
+    pub fn path_prop(&self) -> Option<&PropNode> {
+        self.children.iter().find(|c| c.kind == "path")
+    }
+
     pub fn is_group(&self) -> bool {
         self.kind.is_empty()
     }
@@ -220,6 +324,11 @@ impl PropNode {
     fn parse(v: &Value) -> PropNode {
         let keys =
             v.get("keys").and_then(Value::as_array).map(|a| a.iter().filter_map(|k| k.get("time").and_then(Value::as_f64)).collect()).unwrap_or_default();
+        let uid = v.get("uid").and_then(Value::as_u64).unwrap_or(0);
+        let mut children: Vec<PropNode> = v.get("children").and_then(Value::as_array).map(|a| a.iter().map(PropNode::parse).collect()).unwrap_or_default();
+        for c in &mut children {
+            c.group = uid;
+        }
         PropNode {
             path: text(v, "path"),
             name: text(v, "name"),
@@ -228,8 +337,11 @@ impl PropNode {
             keys,
             enabled: v.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             effect: v.get("effect").and_then(Value::as_str).map(str::to_string),
-            expression: v.get("expression").is_some(),
-            children: v.get("children").and_then(Value::as_array).map(|a| a.iter().map(PropNode::parse).collect()).unwrap_or_default(),
+            expression: v.get("expression").and_then(Value::as_str).map(str::to_string),
+            children,
+            uid,
+            group: 0,
+            mask: v.get("mask").map(|m| MaskState { mode: text(m, "mode"), inverted: m.get("inverted").and_then(Value::as_bool).unwrap_or(false) }),
         }
     }
 }
@@ -532,6 +644,165 @@ impl Editor {
         self.run("keys.delete", json!({})).map(drop)
     }
 
+    /// Adds a mask to the layer, sized to the layer, and returns its id.
+    pub fn add_mask(&mut self, layer: u64, shape: MaskShape) -> Result<u64> {
+        let shape = if shape == MaskShape::Ellipse { "ellipse" } else { "rect" };
+        let r = self.run("layer.addMask", json!({ "layer": layer, "shape": shape }))?;
+        r.get("mask").and_then(Value::as_u64).ok_or_else(|| err("the mask was not created"))
+    }
+
+    /// How a mask combines with the masks above it (one of [`MASK_MODES`]).
+    pub fn set_mask_mode(&mut self, layer: u64, mask: u64, mode: &str) -> Result<()> {
+        if !MASK_MODES.contains(&mode) {
+            return Err(err(format!("`{mode}` is not a mask mode")));
+        }
+        self.run("layer.mask.mode", json!({ "layer": layer, "mask": mask, "mode": mode })).map(drop)
+    }
+
+    pub fn set_mask_inverted(&mut self, layer: u64, mask: u64, inverted: bool) -> Result<()> {
+        self.run("layer.mask.invert", json!({ "layer": layer, "mask": mask, "value": inverted })).map(drop)
+    }
+
+    pub fn remove_mask(&mut self, layer: u64, mask: u64) -> Result<()> {
+        self.run("layer.mask.remove", json!({ "layer": layer, "mask": mask })).map(drop)
+    }
+
+    /// Adds a gradient fill or stroke to a shape layer; returns the new item's id. It goes inside the
+    /// layer's first shape group, just above the solid fill (or stroke) there, which is the place where it
+    /// paints the shape; a layer without a group gets it at the top level.
+    pub fn add_gradient(&mut self, layer: u64, stroke: bool) -> Result<u64> {
+        let kind = if stroke { "gradientStroke" } else { "gradientFill" };
+        let tree = self.layer_tree(layer, 6)?;
+        let group = tree.find("contents/group/contents");
+        let mut p = json!({ "layer": layer, "kind": kind });
+        if group.is_some() {
+            p["group"] = json!("contents/group");
+        }
+        let r = self.run("layer.addShapeItem", p)?;
+        let uid = r.get("uid").and_then(Value::as_u64).ok_or_else(|| err("the gradient was not added"))?;
+        let plain = if stroke { "/stroke" } else { "/fill" };
+        if let Some(i) = group.and_then(|g| g.children.iter().position(|c| c.path.ends_with(plain))) {
+            self.run("prop.moveGroup", json!({ "layer": layer, "prop": uid, "index": i + 1 }))?;
+        }
+        Ok(uid)
+    }
+
+    /// Points a layer-reference property (an effect's Layer menu) at a layer, or at none.
+    pub fn set_layer_link(&mut self, layer: u64, path: &str, target: Option<u64>) -> Result<()> {
+        self.run("prop.set", json!({ "layer": layer, "path": path, "value": target })).map(drop)
+    }
+
+    /// Ties a property to another layer's property (`target_prop` is its id) with an expression, as the
+    /// pick-whip does, and returns the expression.
+    pub fn pick_whip(&mut self, layer: u64, path: &str, target_layer: u64, target_prop: u64) -> Result<String> {
+        let r = self.run("prop.pickWhip", json!({ "layer": layer, "path": path, "target": { "layer": target_layer, "prop": target_prop } }))?;
+        Ok(r.as_str().unwrap_or_default().to_string())
+    }
+
+    /// A gradient property (a shape's Gradient Fill ▸ Colors, say) at the current time.
+    pub fn gradient(&mut self, layer: u64, path: &str) -> Result<crate::gradient::GradientData> {
+        let r = self.run("prop.get", json!({ "layer": layer, "path": path }))?;
+        r.get("value").and_then(crate::gradient::GradientData::from_json).ok_or_else(|| err(format!("{path} is not a gradient")))
+    }
+
+    /// Sets a gradient property; on an animated one this keys the current time. Inside a gesture, edits merge into one undo step.
+    pub fn set_gradient(&mut self, layer: u64, path: &str, g: &crate::gradient::GradientData) -> Result<()> {
+        self.run("prop.set", json!({ "layer": layer, "path": path, "value": g.to_json() })).map(drop)
+    }
+
+    /// The points of a mask or shape path (`path` is the path property's address) at the current time.
+    pub fn path_data(&mut self, layer: u64, path: &str) -> Result<PathData> {
+        let r = self.run("prop.get", json!({ "layer": layer, "path": path }))?;
+        r.get("value").and_then(PathData::from_json).ok_or_else(|| err(format!("{path} is not a path")))
+    }
+
+    /// Moves a vertex (`point`, in the path's own space) and/or its handles. `group` is the mask's or shape path's id.
+    pub fn set_vertex(&mut self, layer: u64, group: u64, index: usize, point: Option<[f64; 2]>, handles: Option<([f64; 2], [f64; 2])>) -> Result<()> {
+        let mut p = json!({ "layer": layer, "mask": group, "index": index });
+        if let Some(pt) = point {
+            p["point"] = json!([finite(pt[0])?, finite(pt[1])?]);
+        }
+        if let Some((tin, tout)) = handles {
+            p["in"] = json!([finite(tin[0])?, finite(tin[1])?]);
+            p["out"] = json!([finite(tout[0])?, finite(tout[1])?]);
+        }
+        self.run("mask.setVertex", p).map(drop)
+    }
+
+    /// Splits the segment starting at vertex `segment` at `t` (0..1) and returns the new vertex's index.
+    pub fn insert_vertex(&mut self, layer: u64, group: u64, segment: usize, t: f64) -> Result<usize> {
+        self.run("mask.insertVertex", json!({ "layer": layer, "mask": group, "segment": segment, "t": finite(t)?.clamp(0.0, 1.0) }))?;
+        // The new vertex follows `segment` (an open path's last segment cannot be split, so this stays in range).
+        Ok(segment + 1)
+    }
+
+    pub fn delete_vertex(&mut self, layer: u64, group: u64, index: usize) -> Result<()> {
+        let v = json!([{ "layer": layer, "mask": group, "index": index }]);
+        self.run("mask.selectVertices", json!({ "vertices": v }))?;
+        self.run("mask.deleteVertices", json!({})).map(drop)
+    }
+
+    /// Makes a vertex smooth or a corner.
+    pub fn smooth_vertex(&mut self, layer: u64, group: u64, index: usize, smooth: bool) -> Result<()> {
+        self.run("mask.convertVertex", json!({ "layer": layer, "mask": group, "index": index, "smooth": smooth })).map(drop)
+    }
+
+    pub fn set_path_closed(&mut self, layer: u64, group: u64, closed: bool) -> Result<()> {
+        self.run("mask.setClosed", json!({ "layer": layer, "mask": group, "closed": closed })).map(drop)
+    }
+
+    /// How the keyframe of `prop` (a property id) nearest `time` eases.
+    pub fn key_ease(&mut self, layer: u64, prop: u64, time: f64) -> Result<KeyEase> {
+        let r = self.run("keys.info", json!({ "keys": [{ "layer": layer, "prop": prop, "time": finite(time)? }] }))?;
+        let k = r.as_array().and_then(|a| a.first()).ok_or_else(|| err("no keyframe there"))?;
+        let eases = |key: &str| -> Eases {
+            k.get(key).and_then(Value::as_array).map(|a| a.iter().map(|e| (num(e, "speed"), num(e, "influence"))).collect()).unwrap_or_default()
+        };
+        let value = match k.get("value") {
+            Some(Value::Array(a)) => a.iter().filter_map(Value::as_f64).collect(),
+            Some(v) => v.as_f64().map(|n| vec![n]).unwrap_or_default(),
+            None => vec![],
+        };
+        Ok(KeyEase {
+            time: num(k, "time"),
+            value,
+            spatial: k.get("spatial").is_some_and(|s| !s.is_null()),
+            in_ease: eases("inEase"),
+            out_ease: eases("outEase"),
+            interp_in: text(k, "in"),
+            interp_out: text(k, "out"),
+            units: text(k, "units"),
+        })
+    }
+
+    /// Sets one side of a key's ease. `dim` limits it to one dimension; `merge` joins a drag's
+    /// many edits into a single undo step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_key_ease(&mut self, layer: u64, path: &str, time: f64, out: bool, dim: Option<usize>, speed: f64, influence: f64, merge: &str) -> Result<()> {
+        let mut p = json!({
+            "layer": layer, "path": path, "time": finite(time)?, "side": if out { "out" } else { "in" },
+            "speed": finite(speed)?, "influence": finite(influence)?, "merge": merge,
+        });
+        if let (Some(d), Some(o)) = (dim, p.as_object_mut()) {
+            o.insert("dim".into(), json!(d));
+        }
+        self.run("keys.setEase", p).map(drop)
+    }
+
+    /// Sets a property's expression. The engine checks the syntax; when it refuses the text the
+    /// change is undone and its message comes back as the error. Empty text removes the expression.
+    pub fn set_expression(&mut self, layer: u64, path: &str, text: &str) -> Result<()> {
+        let r = self.run("prop.setExpression", json!({ "layer": layer, "path": path, "expression": text }))?;
+        match r.get("error").and_then(Value::as_str) {
+            Some(e) => {
+                let e = e.to_string();
+                self.undo()?;
+                Err(err(format!("Expression error: {e}")))
+            }
+            None => Ok(()),
+        }
+    }
+
     pub fn easy_ease_keys(&mut self) -> Result<()> {
         self.run("keys.easyEase", json!({})).map(drop)
     }
@@ -627,6 +898,108 @@ impl Editor {
     }
 }
 
+/// Progress of a background analysis (camera solve or subject isolation).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobProgress {
+    pub running: bool,
+    /// 0.0 to 1.0.
+    pub fraction: f32,
+    /// What the engine says it is doing, when it says anything.
+    pub step: String,
+    /// Set when the engine gave up; the text says why.
+    pub error: Option<String>,
+    /// The analysis finished and produced a result.
+    pub done: bool,
+}
+
+fn unit(v: f64) -> f32 {
+    if v.is_finite() { v.clamp(0.0, 1.0) as f32 } else { 0.0 }
+}
+
+impl Editor {
+    /// Starts the 3D camera tracker on a footage layer. It runs in the background; poll
+    /// [`Editor::camera_track_progress`]. Returns the effect that holds the solve.
+    pub fn start_camera_track(&mut self, layer: u64) -> Result<u64> {
+        let r = self.run("track.camera", json!({ "layer": layer, "wait": false }))?;
+        r.get("effect").and_then(Value::as_u64).ok_or_else(|| err("the camera tracker did not start"))
+    }
+
+    pub fn camera_track_progress(&mut self, layer: u64) -> Result<JobProgress> {
+        let v = self.run("camera.solveStatus", json!({ "layer": layer }))?;
+        let running = v.get("running").and_then(Value::as_bool).unwrap_or(false);
+        let analyzed = v.get("analyzed").and_then(Value::as_bool).unwrap_or(false);
+        let p = v.get("progress").cloned().unwrap_or(Value::Null);
+        let error = p.get("error").and_then(Value::as_str).map(str::to_string);
+        let (done, total, step) = (
+            p.get("done").and_then(Value::as_f64).unwrap_or(0.0),
+            p.get("total").and_then(Value::as_f64).unwrap_or(0.0),
+            p.get("step").and_then(Value::as_f64).unwrap_or(1.0),
+        );
+        let frac = if total > 0.0 { done / total } else { 0.0 };
+        // Two stages: reading the frames, then solving the camera.
+        let fraction = if analyzed { 1.0 } else { unit((step.max(1.0) - 1.0) / 2.0 + frac / 2.0) };
+        let banner = v.get("banner").and_then(Value::as_str).unwrap_or_default().to_string();
+        let failed = !running && !analyzed;
+        Ok(JobProgress {
+            running,
+            fraction,
+            step: banner,
+            error: error.or_else(|| failed.then(|| "Not enough trackable detail in this clip".to_string())),
+            done: analyzed && !running,
+        })
+    }
+
+    pub fn cancel_camera_track(&mut self) -> Result<()> {
+        self.run("camera.cancel", json!({})).map(drop)
+    }
+
+    /// Turns a finished solve into a 3D camera layer that follows the footage.
+    pub fn add_tracked_camera(&mut self, layer: u64) -> Result<u64> {
+        let r = self.run("camera.create", json!({ "layer": layer }))?;
+        r.get("camera").and_then(Value::as_u64).ok_or_else(|| err("no camera was created"))
+    }
+
+    /// Where a point of the composition (in composition pixels) lands in the layer's own pixels,
+    /// for placing a subject marker on footage that has been moved or scaled.
+    pub fn layer_point(&mut self, layer: u64, x: f64, y: f64) -> Result<[f64; 2]> {
+        let get = |e: &mut Editor, path: &str| e.prop(layer, path).map(|p| p.value).unwrap_or_default();
+        let pos = get(self, "transform/position");
+        let anchor = get(self, "transform/anchor");
+        let scale = get(self, "transform/scale");
+        let at = |v: &[f64], i: usize, d: f64| v.get(i).copied().filter(|n| n.is_finite()).unwrap_or(d);
+        let sx = (at(&scale, 0, 100.0) / 100.0).abs().max(0.01);
+        let sy = (at(&scale, 1, 100.0) / 100.0).abs().max(0.01);
+        Ok([(x - at(&pos, 0, x)) / sx + at(&anchor, 0, 0.0), (y - at(&pos, 1, y)) / sy + at(&anchor, 1, 0.0)])
+    }
+
+    /// Isolates the subject under `point` (layer pixels) with an Object Matte and follows it
+    /// through the clip in the background. Returns the effect that holds the matte.
+    pub fn select_subject(&mut self, layer: u64, point: [f64; 2]) -> Result<u64> {
+        if !point.iter().all(|n| n.is_finite()) {
+            return Err(err("that point is not on the picture"));
+        }
+        let r = self.run("objectMatte.apply", json!({ "layer": layer, "point": point }))?;
+        let effect = r.get("effect").and_then(Value::as_u64).ok_or_else(|| err("the subject could not be selected"))?;
+        self.run("objectMatte.propagate", json!({ "layer": layer, "effect": effect, "direction": "both", "wait": false }))?;
+        Ok(effect)
+    }
+
+    pub fn subject_progress(&mut self, layer: u64, effect: u64) -> Result<JobProgress> {
+        let v = self.run("objectMatte.status", json!({ "layer": layer, "effect": effect }))?;
+        let running = v.get("running").and_then(Value::as_bool).unwrap_or(false);
+        let p = v.get("progress").cloned().unwrap_or(Value::Null);
+        let error = p.get("error").and_then(Value::as_str).map(str::to_string);
+        let total = v.get("frames").and_then(Value::as_array).map_or(0, Vec::len) as f64;
+        let computed = v.get("computed").and_then(Value::as_array).map_or(0, Vec::len) as f64;
+        let fraction = if total > 0.0 { unit(computed / total) } else { 0.0 };
+        Ok(JobProgress { running, fraction, step: String::new(), error, done: !running && total > 0.0 && computed >= total })
+    }
+
+    pub fn cancel_subject(&mut self) -> Result<()> {
+        self.run("roto.cancel", json!({})).map(drop)
+    }
+}
+
 fn render_queue(session: &mut Session, path: &str, format: RenderFormat, half: bool) -> Result<String> {
     let run = |s: &mut Session, c: &str, p: Value| s.execute(c, p).map_err(|e| err(format!("{c}: {e}")));
     let fmt = match format {
@@ -646,12 +1019,71 @@ fn render_queue(session: &mut Session, path: &str, format: RenderFormat, half: b
     if done.is_empty() { Err(err("the render produced no file")) } else { Ok(done) }
 }
 
+/// The message a cancelled render fails with, so callers can tell it from a real failure.
+pub const RENDER_CANCELLED: &str = "Render cancelled";
+
+/// Renders the active composition in the background of `session` and polls it. `progress` gets the
+/// fraction done (`0.0..=1.0`) about every 150 ms and returns `false` to stop the render.
+fn render_queue_polled(session: &mut Session, path: &str, format: RenderFormat, half: bool, progress: &mut dyn FnMut(f32) -> bool) -> Result<String> {
+    let run = |s: &mut Session, c: &str, p: Value| s.execute(c, p).map_err(|e| err(format!("{c}: {e}")));
+    let fmt = match format {
+        RenderFormat::Mp4 => "h264",
+        RenderFormat::Gif => "gif",
+    };
+    let queued = run(session, "renderQueue.add", json!({ "format": fmt, "output": path, "resolution": if half { "half" } else { "full" } }))?;
+    run(session, "renderQueue.render", json!({ "wait": false }))?;
+    let started = std::time::Instant::now();
+    let (mut seen, mut cancelled) = (false, false);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let jobs = run(session, "jobs.list", json!({}))?;
+        let running = jobs.get("running").and_then(Value::as_array).and_then(|a| a.iter().find(|j| text(j, "id") == "render"));
+        match running {
+            Some(j) => {
+                seen = true;
+                let fraction = (num(j, "fraction") as f32).clamp(0.0, 1.0);
+                if !progress(fraction) && !cancelled {
+                    cancelled = true;
+                    run(session, "jobs.cancel", json!({ "job": "render" }))?;
+                }
+            }
+            // The job may not be listed for an instant after it starts.
+            None if seen || started.elapsed().as_secs() >= 3 => break,
+            None => {}
+        }
+        if started.elapsed().as_secs() > 6 * 3600 {
+            return Err(err("the render took too long"));
+        }
+    }
+    if cancelled {
+        return Err(err(RENDER_CANCELLED));
+    }
+    progress(1.0);
+    let item = queued.get("item").and_then(Value::as_u64);
+    let list = run(session, "renderQueue.list", json!({}))?;
+    let done = list
+        .get("items")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|i| i.get("id").and_then(Value::as_u64) == item))
+        .map(|i| text(i, "last_output"))
+        .unwrap_or_default();
+    if done.is_empty() { Err(err("the render produced no file")) } else { Ok(done) }
+}
+
 /// Opens a saved copy of a project in `session` and renders one composition: what a background
-/// render runs, so the editor stays usable meanwhile.
-pub fn render_saved_project(session: &mut Session, project: &str, comp: u64, out: &str, format: RenderFormat, half: bool) -> Result<String> {
+/// render runs, so the editor stays usable meanwhile. `progress` is as for [`render_queue_polled`].
+pub fn render_saved_project(
+    session: &mut Session,
+    project: &str,
+    comp: u64,
+    out: &str,
+    format: RenderFormat,
+    half: bool,
+    progress: &mut dyn FnMut(f32) -> bool,
+) -> Result<String> {
     session.execute("file.open", json!({ "path": project })).map_err(|e| err(format!("file.open: {e}")))?;
     session.execute("comp.open", json!({ "comp": comp })).map_err(|e| err(format!("comp.open: {e}")))?;
-    render_queue(session, out, format, half)
+    render_queue_polled(session, out, format, half, progress)
 }
 
 /// `effects/#2` → `2`... the engine's effect selector is the 1-based index inside the path.
@@ -893,6 +1325,140 @@ mod tests {
     }
 
     #[test]
+    fn masks_can_be_added_changed_inverted_and_removed() {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        small_comp(&mut e);
+        let layer = e.comp().unwrap().unwrap().layers[0].id;
+        assert!(e.layer_tree(layer, 6).unwrap().masks().is_empty());
+        let a = e.add_mask(layer, MaskShape::Rectangle).unwrap();
+        let b = e.add_mask(layer, MaskShape::Ellipse).unwrap();
+        let tree = e.layer_tree(layer, 6).unwrap();
+        let masks = tree.masks();
+        assert_eq!(masks.iter().map(|m| m.uid).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(masks[0].mask, Some(MaskState { mode: "Add".into(), inverted: false }));
+        e.set_mask_mode(layer, b, "Subtract").unwrap();
+        e.set_mask_inverted(layer, b, true).unwrap();
+        let tree = e.layer_tree(layer, 6).unwrap();
+        assert_eq!(tree.masks()[1].mask, Some(MaskState { mode: "Subtract".into(), inverted: true }));
+        assert_eq!(tree.masks()[0].mask, Some(MaskState { mode: "Add".into(), inverted: false }), "the other mask is untouched");
+        assert!(e.set_mask_mode(layer, b, "Sideways").is_err());
+        // Undo puts the mode back; removing takes the mask away.
+        e.undo().unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.layer_tree(layer, 6).unwrap().masks()[1].mask, Some(MaskState { mode: "Add".into(), inverted: false }));
+        e.remove_mask(layer, a).unwrap();
+        let left: Vec<u64> = e.layer_tree(layer, 6).unwrap().masks().iter().map(|m| m.uid).collect();
+        assert_eq!(left, vec![b]);
+    }
+
+    /// A comp with one layer whose opacity goes 100 -> 20 over one second, as two keyframes.
+    fn fading_layer() -> (Editor, u64, u64) {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        e.new_comp("Fade", 96, 54, 10.0, 4.0).unwrap();
+        e.add_layer(NewLayer::Solid).unwrap();
+        let layer = e.comp().unwrap().unwrap().layers[0].id;
+        e.set_time(0.0).unwrap();
+        e.toggle_key(layer, "transform/opacity").unwrap();
+        e.set_time(1.0).unwrap();
+        e.toggle_key(layer, "transform/opacity").unwrap();
+        e.set_scalar(layer, "transform/opacity", 20.0).unwrap();
+        let uid = e.layer_tree(layer, 4).unwrap().find("transform/opacity").unwrap().uid;
+        (e, layer, uid)
+    }
+
+    #[test]
+    fn a_keyframes_ease_can_be_read_and_set_one_side_at_a_time() {
+        let (mut e, layer, uid) = fading_layer();
+        let a = e.key_ease(layer, uid, 0.0).unwrap();
+        let b = e.key_ease(layer, uid, 1.0).unwrap();
+        assert_eq!((a.time, b.time), (0.0, 1.0));
+        assert_eq!((a.value.clone(), b.value.clone()), (vec![100.0], vec![20.0]));
+        assert_eq!(a.dims(), 1);
+        assert_eq!(a.units, "%/sec");
+        // Push A's outgoing handle to 60 % influence at speed 0, and leave B alone.
+        e.set_key_ease(layer, "transform/opacity", 0.0, true, None, 0.0, 60.0, "t1").unwrap();
+        let a2 = e.key_ease(layer, uid, 0.0).unwrap();
+        assert_eq!(a2.out_ease, vec![(0.0, 60.0)]);
+        assert_eq!(a2.interp_out, "bezier");
+        assert_eq!(e.key_ease(layer, uid, 1.0).unwrap().in_ease, b.in_ease, "B's incoming side is untouched");
+        // B's incoming side: -80 %/s at 25 % influence.
+        e.set_key_ease(layer, "transform/opacity", 1.0, false, None, -80.0, 25.0, "t2").unwrap();
+        assert_eq!(e.key_ease(layer, uid, 1.0).unwrap().in_ease, vec![(-80.0, 25.0)]);
+        // Edits that share a merge key undo together.
+        e.set_key_ease(layer, "transform/opacity", 1.0, false, None, -70.0, 30.0, "t2").unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.key_ease(layer, uid, 1.0).unwrap().in_ease, b.in_ease, "one undo reverts the whole drag");
+        assert!(e.set_key_ease(layer, "transform/opacity", 1.0, true, None, f64::NAN, 30.0, "x").is_err());
+    }
+
+    #[test]
+    fn an_expression_can_be_set_replaced_rejected_and_removed() {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        small_comp(&mut e);
+        let layer = e.comp().unwrap().unwrap().layers[0].id;
+        let expr = |e: &mut Editor| e.layer_tree(layer, 4).unwrap().find("transform/rotation").unwrap().expression.clone();
+        assert_eq!(expr(&mut e), None);
+        e.set_expression(layer, "transform/rotation", "time * 90").unwrap();
+        assert_eq!(expr(&mut e).as_deref(), Some("time * 90"));
+        e.set_expression(layer, "transform/rotation", "wiggle(2, 30)").unwrap();
+        assert_eq!(expr(&mut e).as_deref(), Some("wiggle(2, 30)"));
+        // A syntax error is refused, the message comes back, and the good text stays.
+        let bad = e.set_expression(layer, "transform/rotation", "time * * (").unwrap_err();
+        assert!(bad.to_string().starts_with("Expression error:"), "{bad}");
+        assert_eq!(expr(&mut e).as_deref(), Some("wiggle(2, 30)"), "a refused expression leaves the old one");
+        e.set_expression(layer, "transform/rotation", "").unwrap();
+        assert_eq!(expr(&mut e), None);
+        assert!(e.set_expression(layer, "no/such/prop", "1").is_err());
+    }
+
+    /// Saves a project holding one composition and returns (dir, project path, comp id).
+    fn saved(tag: &str, name: &str, w: u32, h: u32, fps: f64, secs: f64) -> (std::path::PathBuf, String, u64) {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        e.new_comp(name, w, h, fps, secs).unwrap();
+        e.add_layer(NewLayer::Solid).unwrap();
+        let comp = e.comp().unwrap().unwrap().id;
+        let dir = std::env::temp_dir().join(format!("ec-mobile-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = dir.join("p.ecproj");
+        e.save(Some(project.to_str().unwrap())).unwrap();
+        (dir, project.to_string_lossy().into_owned(), comp)
+    }
+
+    #[test]
+    fn a_render_reports_progress_up_to_done() {
+        let (dir, project, comp) = saved("progress", "Short", 96, 54, 10.0, 2.0);
+        let out = dir.join("o.gif");
+        let mut seen: Vec<f32> = Vec::new();
+        let mut other = effectcraft_host::session();
+        let done = render_saved_project(&mut other, &project, comp, out.to_str().unwrap(), RenderFormat::Gif, true, &mut |f| {
+            seen.push(f);
+            true
+        })
+        .unwrap();
+        assert!(std::fs::metadata(&done).unwrap().len() > 100);
+        assert_eq!(seen.last().copied(), Some(1.0), "{seen:?}");
+        assert!(seen.iter().all(|f| (0.0..=1.0).contains(f)) && seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_render_can_be_stopped_and_says_so() {
+        let (dir, project, comp) = saved("cancel", "Long", 1280, 720, 30.0, 120.0);
+        let out = dir.join("o.mp4");
+        let mut other = effectcraft_host::session();
+        let started = std::time::Instant::now();
+        let r = render_saved_project(&mut other, &project, comp, out.to_str().unwrap(), RenderFormat::Mp4, false, &mut |_| false);
+        let e = r.expect_err("a stopped render is not a success");
+        assert_eq!(e.to_string(), RENDER_CANCELLED);
+        assert!(started.elapsed().as_secs() < 60, "stopping took {:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_comp_renders_to_gif_and_to_mp4_in_a_second_session() {
         let mut e = Editor::new(effectcraft_host::session());
         e.new_project().unwrap();
@@ -905,8 +1471,8 @@ mod tests {
         for (format, ext) in [(RenderFormat::Gif, "gif"), (RenderFormat::Mp4, "mp4")] {
             let out = dir.join(format!("out.{ext}"));
             let mut other = effectcraft_host::session();
-            let done =
-                render_saved_project(&mut other, project.to_str().unwrap(), comp, out.to_str().unwrap(), format, true).unwrap_or_else(|x| panic!("{ext}: {x}"));
+            let done = render_saved_project(&mut other, project.to_str().unwrap(), comp, out.to_str().unwrap(), format, true, &mut |_| true)
+                .unwrap_or_else(|x| panic!("{ext}: {x}"));
             let len = std::fs::metadata(&done).unwrap().len();
             assert!(len > 100, "{done} is {len} bytes");
         }
@@ -950,5 +1516,127 @@ mod tests {
         e.nudge(362, 1.0, 0.0).unwrap();
         e.undo().unwrap();
         assert_eq!(e.prop(362, "transform/position").unwrap().value[0], before[0] + 1.0);
+    }
+
+    /// A short clip rendered by the engine itself, shared by the tracking tests.
+    fn clip() -> String {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        let dir = std::env::temp_dir().join(format!("effectia-test-clip-{}", std::process::id()));
+        let path = dir.join("clip.mp4");
+        ONCE.call_once(|| {
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut e = Editor::new(effectcraft_host::session());
+            e.new_project().unwrap();
+            e.new_comp("Clip", 320, 180, 24.0, 1.0).unwrap();
+            e.add_layer(NewLayer::Star).unwrap();
+            e.render_to_file(path.to_str().unwrap(), RenderFormat::Mp4, false).unwrap();
+        });
+        path.to_string_lossy().into_owned()
+    }
+
+    fn footage_project() -> (Editor, u64) {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        e.new_comp("Main", 320, 180, 24.0, 1.0).unwrap();
+        let layer = e.import_and_add(&clip()).unwrap();
+        e.select_layer(layer).unwrap();
+        (e, layer)
+    }
+
+    fn wait_for(mut poll: impl FnMut() -> JobProgress) -> JobProgress {
+        let start = std::time::Instant::now();
+        loop {
+            let p = poll();
+            if !p.running || start.elapsed().as_secs() > 60 {
+                return p;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn the_camera_tracker_solves_footage_and_adds_a_camera_layer() {
+        let (mut e, layer) = footage_project();
+        e.start_camera_track(layer).unwrap();
+        let p = wait_for(|| e.camera_track_progress(layer).unwrap());
+        assert!(p.done && p.error.is_none(), "{p:?}");
+        assert!((p.fraction - 1.0).abs() < 1e-6);
+        let camera = e.add_tracked_camera(layer).unwrap();
+        let comp = e.comp().unwrap().unwrap();
+        assert!(comp.layers.iter().any(|l| l.id == camera && l.kind == "Camera"));
+        e.undo().unwrap();
+        assert!(!e.comp().unwrap().unwrap().layers.iter().any(|l| l.id == camera), "adding the camera is one undo step");
+    }
+
+    #[test]
+    fn selecting_a_subject_adds_an_object_matte_and_follows_it() {
+        let (mut e, layer) = footage_project();
+        let effect = e.select_subject(layer, [160.0, 90.0]).unwrap();
+        let p = wait_for(|| e.subject_progress(layer, effect).unwrap());
+        assert!(p.done && p.error.is_none(), "{p:?}");
+        let effects = e.layer_tree(layer, 4).unwrap();
+        assert!(effects.find("effects").is_some_and(|n| !n.children.is_empty()));
+    }
+
+    #[test]
+    fn selecting_a_subject_rejects_a_non_finite_point() {
+        let (mut e, layer) = footage_project();
+        assert!(e.select_subject(layer, [f64::NAN, 1.0]).is_err());
+    }
+
+    #[test]
+    fn a_composition_point_maps_back_into_the_layer() {
+        let (mut e, layer) = footage_project();
+        let p = e.layer_point(layer, 160.0, 90.0).unwrap();
+        assert!(p[0].is_finite() && p[1].is_finite());
+        // The clip is centred and unscaled, so the middle of the composition is the middle of the clip.
+        assert!((p[0] - 160.0).abs() < 1.0 && (p[1] - 90.0).abs() < 1.0, "{p:?}");
+    }
+
+    #[test]
+    fn a_gradient_fill_paints_the_shape_and_edits_stick() {
+        use crate::gradient::{GradientData, Track};
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        e.new_comp("G", 320, 180, 24.0, 1.0).unwrap();
+        let star = e.add_layer(NewLayer::Star).unwrap();
+        let before = e.render(180).unwrap();
+        let item = e.add_gradient(star, false).unwrap();
+        let tree = e.layer_tree(star, 8).unwrap();
+        let colors = tree.find_kind("gradient").unwrap();
+        assert!(colors.path.contains("group"), "it sits inside the shape's group: {}", colors.path);
+        let path = format!("@{}", colors.uid);
+        assert!(item != 0 && colors.group == item);
+
+        // Left and right of the star differ now, and the plain fill is covered.
+        let px = |f: &crate::editor::Frame, x: f32| {
+            let (ix, iy) = ((x * f.width as f32) as usize, f.height as usize / 2);
+            let o = (iy * f.width as usize + ix) * 4;
+            [f.rgba[o], f.rgba[o + 1], f.rgba[o + 2]]
+        };
+        let after = e.render(180).unwrap();
+        assert_ne!(px(&before, 0.45), px(&after, 0.45));
+        assert_ne!(px(&after, 0.45), px(&after, 0.55), "a ramp, not a flat colour");
+
+        // An edit of the stops is read back, and the picture follows.
+        let mut g = e.gradient(star, &path).unwrap();
+        g.set_rgb(0, [1.0, 0.0, 0.0]);
+        let i = g.add(Track::Color, 0.5);
+        g.set_rgb(i, [0.0, 1.0, 0.0]);
+        e.set_gradient(star, &path, &g).unwrap();
+        assert_eq!(e.gradient(star, &path).unwrap().colors.len(), 3);
+        assert_ne!(px(&e.render(180).unwrap(), 0.5), px(&after, 0.5));
+        e.undo().unwrap();
+        assert_eq!(e.gradient(star, &path).unwrap(), GradientData::default());
+        assert!(e.set_gradient(star, "@999999", &g).is_err(), "a missing property is an error");
+    }
+
+    #[test]
+    fn a_gradient_cannot_be_added_to_a_layer_that_is_not_a_shape() {
+        let mut e = Editor::new(effectcraft_host::session());
+        e.new_project().unwrap();
+        e.new_comp("G", 320, 180, 24.0, 1.0).unwrap();
+        let solid = e.add_layer(NewLayer::Solid).unwrap();
+        assert!(e.add_gradient(solid, false).is_err());
     }
 }
